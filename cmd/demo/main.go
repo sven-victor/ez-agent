@@ -13,6 +13,8 @@
 //	go run ./cmd/demo -prompt "What time is it?"   # one-shot, then exit
 //	go run ./cmd/demo -max-turns 10                # per-message tool/model loop cap (0=unlimited)
 //	go run ./cmd/demo -summarize-at 40             # auto-summarize when window exceeds N messages
+//	go run ./cmd/demo -summarize-tokens 80000      # also trigger on coarse token estimate
+//	go run ./cmd/demo -segmented-summary           # tool-driven segmented fallback on overflow
 //	go run ./cmd/demo -provider anthropic
 //	go run ./cmd/demo -session chat1
 //	go run ./cmd/demo -mcp-stdio "npx -y @modelcontextprotocol/server-everything"
@@ -44,7 +46,9 @@ func main() {
 	maxTurns := flag.Int("max-turns", 20, "max model↔tool turns per user message (0=unlimited)")
 	summarizeAt := flag.Int("summarize-at", 40, "proactively summarize when model window exceeds N messages (0=overflow-only)")
 	summaryKeep := flag.Int("summary-keep", 10, "messages to keep recent when summarizing")
+	summarizeTokens := flag.Int("summarize-tokens", 0, "proactively summarize when estimated tokens exceed N (0=off)")
 	noSummarize := flag.Bool("no-summarize", false, "disable automatic context summarization")
+	segmentedSummary := flag.Bool("segmented-summary", false, "enable tool-driven segmented summarization fallback on overflow")
 
 	var mcpCfg mcpConfig
 	flag.Func("mcp-stdio", "MCP stdio server as \"command [args...]\" (repeatable)", func(s string) error {
@@ -62,15 +66,17 @@ func main() {
 	flag.Parse()
 
 	cfg := demoConfig{
-		Prompt:       *prompt,
-		ModelID:      *modelID,
-		ProviderName: *providerName,
-		SessionID:    *sessionID,
-		MaxTurns:     *maxTurns,
-		SummarizeAt:  *summarizeAt,
-		SummaryKeep:  *summaryKeep,
-		NoSummarize:  *noSummarize,
-		MCP:          mcpCfg,
+		Prompt:            *prompt,
+		ModelID:           *modelID,
+		ProviderName:      *providerName,
+		SessionID:         *sessionID,
+		MaxTurns:          *maxTurns,
+		SummarizeAt:       *summarizeAt,
+		SummaryKeep:       *summaryKeep,
+		SummarizeTokens:   *summarizeTokens,
+		NoSummarize:       *noSummarize,
+		SegmentedSummary:  *segmentedSummary,
+		MCP:               mcpCfg,
 	}
 	if err := realMain(cfg); err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
@@ -79,15 +85,17 @@ func main() {
 }
 
 type demoConfig struct {
-	Prompt       string
-	ModelID      string
-	ProviderName string
-	SessionID    string
-	MaxTurns     int
-	SummarizeAt  int
-	SummaryKeep  int
-	NoSummarize  bool
-	MCP          mcpConfig
+	Prompt           string
+	ModelID          string
+	ProviderName     string
+	SessionID        string
+	MaxTurns         int
+	SummarizeAt      int
+	SummaryKeep      int
+	SummarizeTokens  int
+	NoSummarize      bool
+	SegmentedSummary bool
+	MCP              mcpConfig
 }
 
 func realMain(cfg demoConfig) error {
@@ -96,6 +104,9 @@ func realMain(cfg demoConfig) error {
 	}
 	if cfg.SummarizeAt < 0 {
 		return fmt.Errorf("-summarize-at must be >= 0")
+	}
+	if cfg.SummarizeTokens < 0 {
+		return fmt.Errorf("-summarize-tokens must be >= 0")
 	}
 	if cfg.SummaryKeep < 1 {
 		return fmt.Errorf("-summary-keep must be >= 1")
@@ -153,10 +164,21 @@ func realMain(cfg demoConfig) error {
 	}
 	if cfg.NoSummarize {
 		fmt.Printf("summarize: off\n")
-	} else if cfg.SummarizeAt == 0 {
-		fmt.Printf("summarize: overflow-only (keep=%d)\n", cfg.SummaryKeep)
 	} else {
-		fmt.Printf("summarize: at>%d messages (keep=%d)\n", cfg.SummarizeAt, cfg.SummaryKeep)
+		parts := []string{}
+		if cfg.SummarizeAt == 0 {
+			parts = append(parts, "overflow-only")
+		} else {
+			parts = append(parts, fmt.Sprintf("at>%d messages", cfg.SummarizeAt))
+		}
+		if cfg.SummarizeTokens > 0 {
+			parts = append(parts, fmt.Sprintf("tokens>%d", cfg.SummarizeTokens))
+		}
+		parts = append(parts, fmt.Sprintf("keep=%d", cfg.SummaryKeep))
+		if cfg.SegmentedSummary {
+			parts = append(parts, "segmented")
+		}
+		fmt.Printf("summarize: %s\n", strings.Join(parts, ", "))
 	}
 	fmt.Println()
 
@@ -234,20 +256,25 @@ Be concise unless the user asks for detail.`
 func newSummarizePolicy(p model.Provider, cfg demoConfig) memory.ContextPolicy {
 	windowMax := cfg.SummarizeAt
 	if windowMax <= 0 {
-		// Overflow-only mode: still trim hard if Reduce falls through to Window.
 		windowMax = cfg.SummaryKeep * 4
 		if windowMax < 20 {
 			windowMax = 20
 		}
 	}
-	return &memory.Summarize{
-		Summarizer: &memory.ProviderSummarizer{
-			Provider: p,
-		},
+	robust := &memory.RobustSummarizer{Provider: p}
+	pol := &memory.Summarize{
+		Summarizer:           robust,
 		Inner:                &memory.Window{MaxMessages: windowMax},
 		KeepRecent:           cfg.SummaryKeep,
 		ProactiveMaxMessages: cfg.SummarizeAt,
+		ProactiveMaxTokens:   cfg.SummarizeTokens,
+		MaxMessageBytes:      32 * 1024,
+		Fallback:             &memory.Window{MaxMessages: cfg.SummaryKeep},
 	}
+	if cfg.SegmentedSummary {
+		pol.Segmented = &memory.SegmentedSummarizer{Provider: p, MaxTurns: 20}
+	}
+	return pol
 }
 
 func firstNonEmpty(vals ...string) string {

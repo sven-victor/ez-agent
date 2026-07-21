@@ -22,15 +22,27 @@ type Summarizer interface {
 
 // Summarize replaces the oldest fraction of Messages with an LLM summary.
 //
-// Reduce always summarizes (reactive overflow recovery).
-// When ProactiveMaxMessages > 0 and len(Messages) exceeds it, Prepare also
-// summarizes (best-effort: failures are ignored so the model call can proceed).
+// Reduce always attempts summarization (reactive overflow recovery), then
+// optional Segmented, then Fallback (default: drop oldest tool-aware group).
+// When ProactiveMaxMessages / ProactiveMaxTokens thresholds are exceeded,
+// Prepare also summarizes (best-effort: failures are ignored).
 type Summarize struct {
-	Inner                ContextPolicy // optional; run after summarization attempts
-	Summarizer           Summarizer
+	Inner      ContextPolicy // optional; run after summarization attempts
+	Summarizer Summarizer
+	// Segmented is an optional second-stage summarizer used on Reduce when
+	// Summarizer fails (not used during Prepare).
+	Segmented Summarizer
+
 	Ratio                float64 // default 0.3, clamped to [0.1, 0.8]
 	KeepRecent           int     // default 10
-	ProactiveMaxMessages int     // 0 = disabled; Prepare summarizes when len > this
+	ProactiveMaxMessages int     // 0 = disabled; Prepare when len > this
+	ProactiveMaxTokens   int     // 0 = disabled; Prepare when EstimateTokens > this
+	MaxMessageBytes      int     // 0 = off; condense oversized parts before summarize
+	// OmitLatestIntent skips injecting the latest user message into summarizer input.
+	OmitLatestIntent bool
+	// Fallback runs when summarization fails or does not shrink the window.
+	// nil → drop oldest tool-aware message group once.
+	Fallback ContextPolicy
 }
 
 func (s *Summarize) ratio() float64 {
@@ -54,9 +66,22 @@ func (s *Summarize) keepRecent() int {
 	return s.KeepRecent
 }
 
-func (s *Summarize) Prepare(ctx context.Context, st *run.State) error {
+func (s *Summarize) needsProactive(st *run.State) bool {
 	if s.ProactiveMaxMessages > 0 && len(st.Messages) > s.ProactiveMaxMessages {
-		_ = s.summarizeOldest(ctx, st) // best-effort
+		return true
+	}
+	if s.ProactiveMaxTokens > 0 && EstimateTokens(st.Messages) > s.ProactiveMaxTokens {
+		return true
+	}
+	return false
+}
+
+func (s *Summarize) Prepare(ctx context.Context, st *run.State) error {
+	if s.MaxMessageBytes > 0 {
+		st.Messages = CondenseOversizedParts(st.Messages, s.MaxMessageBytes)
+	}
+	if s.needsProactive(st) {
+		_ = s.summarizeOldest(ctx, st, false) // best-effort; no segmented
 	}
 	if s.Inner != nil {
 		return s.Inner.Prepare(ctx, st)
@@ -66,12 +91,22 @@ func (s *Summarize) Prepare(ctx context.Context, st *run.State) error {
 
 func (s *Summarize) Reduce(ctx context.Context, st *run.State) error {
 	before := len(st.Messages)
-	if err := s.summarizeOldest(ctx, st); err != nil {
-		return err
+	if s.MaxMessageBytes > 0 {
+		st.Messages = CondenseOversizedParts(st.Messages, s.MaxMessageBytes)
 	}
+
+	sumErr := s.summarizeOldest(ctx, st, true)
+	if sumErr != nil || len(st.Messages) >= before {
+		if ferr := s.applyFallback(ctx, st); ferr != nil && len(st.Messages) >= before {
+			if sumErr != nil {
+				return fmt.Errorf("summarize reduce: %w (fallback: %v)", sumErr, ferr)
+			}
+			return ferr
+		}
+	}
+
 	if s.Inner != nil {
 		if err := s.Inner.Reduce(ctx, st); err != nil {
-			// Inner reduce may fail if already small; only require overall progress.
 			if len(st.Messages) >= before {
 				return err
 			}
@@ -83,7 +118,22 @@ func (s *Summarize) Reduce(ctx context.Context, st *run.State) error {
 	return nil
 }
 
-func (s *Summarize) summarizeOldest(ctx context.Context, st *run.State) error {
+func (s *Summarize) applyFallback(ctx context.Context, st *run.State) error {
+	if s.Fallback != nil {
+		return s.Fallback.Reduce(ctx, st)
+	}
+	before := len(st.Messages)
+	if before == 0 {
+		return fmt.Errorf("summarize fallback: no messages")
+	}
+	st.Messages = dropOldestGroup(st.Messages)
+	if len(st.Messages) >= before {
+		return fmt.Errorf("summarize fallback: failed to drop messages")
+	}
+	return nil
+}
+
+func (s *Summarize) summarizeOldest(ctx context.Context, st *run.State, allowSegmented bool) error {
 	if s.Summarizer == nil {
 		return fmt.Errorf("summarize: Summarizer is required")
 	}
@@ -104,7 +154,12 @@ func (s *Summarize) summarizeOldest(ctx context.Context, st *run.State) error {
 
 	toSummarize := st.Messages[:count]
 	remaining := st.Messages[count:]
-	summary, err := s.Summarizer.Summarize(ctx, toSummarize)
+	input := s.withIntent(st.Messages, toSummarize)
+
+	summary, err := s.Summarizer.Summarize(ctx, input)
+	if err != nil && allowSegmented && s.Segmented != nil {
+		summary, err = s.Segmented.Summarize(ctx, input)
+	}
 	if err != nil {
 		return fmt.Errorf("summarize: %w", err)
 	}
@@ -115,12 +170,27 @@ func (s *Summarize) summarizeOldest(ctx context.Context, st *run.State) error {
 	return nil
 }
 
+func (s *Summarize) withIntent(full, toSummarize []message.Message) []message.Message {
+	if s.OmitLatestIntent {
+		return toSummarize
+	}
+	intent := lastUserText(full, defaultIntentBytes)
+	if intent == "" {
+		return toSummarize
+	}
+	// Avoid duplicating if the oldest slice already ends with the same user text.
+	note := message.NewUserText("[Context for summarizer] Latest user message:\n" + intent)
+	out := make([]message.Message, 0, len(toSummarize)+1)
+	out = append(out, note)
+	out = append(out, toSummarize...)
+	return out
+}
+
 // adjustSplitPointForToolPairs moves the split forward so we do not orphan a ToolUse.
 func adjustSplitPointForToolPairs(msgs []message.Message, split int) int {
 	if split <= 0 || split >= len(msgs) {
 		return split
 	}
-	// If split lands between toolUse and toolResult, include the result.
 	for split < len(msgs) {
 		if split > 0 && message.HasToolUse(msgs[split-1]) {
 			if isToolResultMessage(msgs[split]) {
@@ -128,9 +198,7 @@ func adjustSplitPointForToolPairs(msgs []message.Message, split int) int {
 				continue
 			}
 		}
-		// If split starts on a dangling tool-result, include it with prior or advance.
 		if isToolResultMessage(msgs[split]) && split+1 <= len(msgs) {
-			// Prefer moving split past the result so remaining does not start with orphan result.
 			split++
 			continue
 		}

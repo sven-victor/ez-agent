@@ -17,7 +17,7 @@ Inspired by [Strands Agents](https://strandsagents.com/) **behavior** (loop, too
 | Streaming | `RunStream` yields typed `event.Event` values |
 | Hooks / Plugins | Before/After Run, Model, Tool; plugins register tools + hooks; `contrib/memoryplugin` |
 | Limits | `MaxTurns`, `MaxTotalTokens`, `MaxOutputTokens`; cancel via `context` |
-| Memory | `Noop`, `Window`, `Summarize`, `Offload`, `DegradeMedia`; `SessionStore`; `LongTerm` |
+| Memory | `Noop`, `Window`, `Summarize` (+ `RobustSummarizer`, `SegmentedSummarizer`), `Offload`, `DegradeMedia`; `SessionStore`; `LongTerm` |
 | Checkpoint | `WithCheckpoint` mid-run snapshots; `LoadCheckpoint` / `SaveCheckpoint` / `Continue` |
 | HITL | `WithInterrupter` pause before tools; `Resume` / `ResumeStream` / `StateFromResult` |
 | Realtime | `realtime.Session` (outside Turn loop); `Pipe` + `realtime/openai` WebSocket |
@@ -94,7 +94,9 @@ go run ./cmd/demo                                          # interactive REPL
 go run ./cmd/demo -prompt "What time is it?"               # one-shot, then exit
 go run ./cmd/demo -max-turns 10                            # per-message loop cap (default 20, 0=unlimited)
 go run ./cmd/demo -summarize-at 40 -summary-keep 10         # auto-summarize model window (default)
-go run ./cmd/demo -no-summarize                            # disable summarization
+go run ./cmd/demo -summarize-tokens 80000                   # also trigger on coarse token estimate
+go run ./cmd/demo -segmented-summary                        # tool-driven segmented fallback on overflow
+go run ./cmd/demo -no-summarize                             # disable summarization
 go run ./cmd/demo -provider anthropic -session chat1
 go run ./cmd/demo -mcp-stdio "npx -y @modelcontextprotocol/server-everything"
 go run ./cmd/demo -mcp-http http://localhost:8080/mcp
@@ -102,7 +104,7 @@ go run ./cmd/demo -mcp-http http://localhost:8080/mcp
 
 Built-in tools: `current_time`, `format_time`, `random_string`. Slash commands in the REPL: `/help`, `/tools`, `/quit`.
 
-Context: by default the demo enables `memory.Summarize` (proactive when the model window exceeds `-summarize-at` messages; also on provider overflow). Session `Transcript` is unchanged — only the model window is compressed.
+Context: by default the demo enables `memory.Summarize` with `RobustSummarizer` (retry / map-reduce / truncate), proactive when the model window exceeds `-summarize-at` messages (optional `-summarize-tokens`), and on provider overflow. Use `-segmented-summary` for tool-driven segmented fallback. Session `Transcript` is unchanged — only the model window is compressed.
 
 ## Architecture
 
@@ -431,12 +433,19 @@ agent.WithContextPolicy(memory.Noop{})
 agent.WithContextPolicy(&memory.Window{MaxMessages: 40})
 
 agent.WithContextPolicy(&memory.Summarize{
-    Summarizer:           &memory.ProviderSummarizer{Provider: p},
-    Inner:                &memory.Window{MaxMessages: 40},
-    Ratio:                0.3,  // fraction of oldest messages to summarize
+    Summarizer: &memory.RobustSummarizer{Provider: p}, // retry + map-reduce + truncate
+    Segmented:  &memory.SegmentedSummarizer{Provider: p}, // optional tool-driven fallback
+    Inner:      &memory.Window{MaxMessages: 40},
+    Fallback:   &memory.Window{MaxMessages: 10}, // if summarization fails, drop oldest
+    Ratio:                0.3,
     KeepRecent:           10,
-    ProactiveMaxMessages: 80,   // Prepare summarizes when len exceeds this (0 = off)
+    ProactiveMaxMessages: 80,
+    ProactiveMaxTokens:   0,          // optional coarse token threshold
+    MaxMessageBytes:      32 * 1024, // truncate oversized parts before summarize
 })
+
+// Simple one-shot summarizer (no map-reduce / truncate):
+// Summarizer: &memory.ProviderSummarizer{Provider: p},
 
 agent.WithContextPolicy(&memory.Offload{
     Store:    memory.NewMemBlobStore(), // or &memory.FileBlobStore{Dir: ".blobs"}
