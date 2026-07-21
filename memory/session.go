@@ -1,0 +1,128 @@
+package memory
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"sync"
+
+	"github.com/sven-victor/ez-agent/message"
+)
+
+// Session is a persisted conversation.
+type Session struct {
+	ID       string
+	Messages []message.Message
+	Values   map[string]any
+}
+
+// SessionStore loads and saves sessions.
+type SessionStore interface {
+	Load(ctx context.Context, id string) (*Session, error)
+	Save(ctx context.Context, s *Session) error
+}
+
+// MemStore is an in-memory SessionStore for tests.
+type MemStore struct {
+	mu   sync.RWMutex
+	data map[string]*Session
+}
+
+// NewMemStore creates an empty MemStore.
+func NewMemStore() *MemStore {
+	return &MemStore{data: make(map[string]*Session)}
+}
+
+func (m *MemStore) Load(_ context.Context, id string) (*Session, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	s, ok := m.data[id]
+	if !ok {
+		return nil, fmt.Errorf("session %q not found", id)
+	}
+	cp := *s
+	cp.Messages = append([]message.Message(nil), s.Messages...)
+	if s.Values != nil {
+		cp.Values = make(map[string]any, len(s.Values))
+		for k, v := range s.Values {
+			cp.Values[k] = v
+		}
+	}
+	return &cp, nil
+}
+
+func (m *MemStore) Save(_ context.Context, s *Session) error {
+	if s == nil || s.ID == "" {
+		return fmt.Errorf("session: id is required")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	cp := *s
+	cp.Messages = append([]message.Message(nil), s.Messages...)
+	if s.Values != nil {
+		cp.Values = make(map[string]any, len(s.Values))
+		for k, v := range s.Values {
+			cp.Values[k] = v
+		}
+	}
+	m.data[s.ID] = &cp
+	return nil
+}
+
+// FileStore persists sessions as JSON under Dir.
+type FileStore struct {
+	Dir string
+}
+
+func (f *FileStore) path(id string) string {
+	return filepath.Join(f.Dir, id+".json")
+}
+
+func (f *FileStore) Load(_ context.Context, id string) (*Session, error) {
+	b, err := os.ReadFile(f.path(id))
+	if err != nil {
+		return nil, err
+	}
+	var wire sessionWire
+	if err := json.Unmarshal(b, &wire); err != nil {
+		return nil, err
+	}
+	msgs, err := decodeMessages(wire.Messages)
+	if err != nil {
+		return nil, err
+	}
+	return &Session{ID: wire.ID, Messages: msgs, Values: wire.Values}, nil
+}
+
+func (f *FileStore) Save(ctx context.Context, s *Session) error {
+	if s == nil || s.ID == "" {
+		return fmt.Errorf("session: id is required")
+	}
+	if err := os.MkdirAll(f.Dir, 0o755); err != nil {
+		return err
+	}
+	blobDir := filepath.Join(f.Dir, s.ID+"_blobs")
+	msgs, err := encodeMessagesForStore(s.Messages, blobDir)
+	if err != nil {
+		return err
+	}
+	wire := sessionWire{ID: s.ID, Messages: msgs, Values: s.Values}
+	b, err := json.MarshalIndent(wire, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(f.path(s.ID), b, 0o644)
+}
+
+type sessionWire struct {
+	ID       string         `json:"id"`
+	Messages []wireMessage  `json:"messages"`
+	Values   map[string]any `json:"values,omitempty"`
+}
+
+var (
+	_ SessionStore = (*MemStore)(nil)
+	_ SessionStore = (*FileStore)(nil)
+)

@@ -1,0 +1,77 @@
+package gemini_test
+
+import (
+	"context"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	"github.com/sven-victor/ez-agent/message"
+	"github.com/sven-victor/ez-agent/model"
+	"github.com/sven-victor/ez-agent/model/gemini"
+	"github.com/sven-victor/ez-agent/run"
+)
+
+func TestGeminiStreamText(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.Contains(r.URL.Path, ":streamGenerateContent") {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hi\"}]},\"finishReason\":\"STOP\"}]}\n\n"))
+	}))
+	defer srv.Close()
+
+	p := gemini.New(
+		gemini.WithBaseURL(srv.URL),
+		gemini.WithAPIKey("k"),
+		gemini.WithHTTPClient(srv.Client()),
+	)
+	res, err := p.Stream(context.Background(), model.Request{
+		Messages: []message.Message{message.NewUserText("hey")},
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if message.TextContent(res.Message) != "hi" {
+		t.Fatalf("text=%q", message.TextContent(res.Message))
+	}
+	if res.StopReason != run.StopEndTurn {
+		t.Fatalf("stop=%s", res.StopReason)
+	}
+}
+
+func TestGeminiCompleteText(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.Contains(r.URL.Path, ":generateContent") || strings.Contains(r.URL.Path, "streamGenerateContent") {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"candidates":[{"content":{"parts":[{"text":"hi"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":1,"candidatesTokenCount":1,"totalTokenCount":2}}`))
+	}))
+	defer srv.Close()
+
+	p := gemini.New(
+		gemini.WithBaseURL(srv.URL),
+		gemini.WithAPIKey("k"),
+		gemini.WithHTTPClient(srv.Client()),
+	)
+	res, err := p.Complete(context.Background(), model.Request{
+		Messages: []message.Message{message.NewUserText("hey")},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if message.TextContent(res.Message) != "hi" {
+		t.Fatalf("text=%q", message.TextContent(res.Message))
+	}
+	if res.StopReason != run.StopEndTurn {
+		t.Fatalf("stop=%s", res.StopReason)
+	}
+	if res.Usage.TotalTokens != 2 {
+		t.Fatalf("usage=%v", res.Usage)
+	}
+}
