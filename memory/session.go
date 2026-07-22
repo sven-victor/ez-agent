@@ -6,12 +6,13 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 
 	"github.com/sven-victor/ez-agent/message"
 )
 
-// Session is a persisted conversation.
+// Session is a persisted conversation window (effective model messages).
 type Session struct {
 	ID       string
 	Messages []message.Message
@@ -19,9 +20,15 @@ type Session struct {
 }
 
 // SessionStore loads and saves sessions.
+//
+// Messages are the effective model window (post-summarize / trim), not a
+// forever-growing transcript. Append grows that window; ReplaceAll replaces it
+// after context reduction (summarize / window trim).
 type SessionStore interface {
 	Load(ctx context.Context, id string) (*Session, error)
 	Save(ctx context.Context, s *Session) error
+	Append(ctx context.Context, id string, msgs ...message.Message) error
+	ReplaceAll(ctx context.Context, id string, msgs []message.Message) error
 }
 
 // MemStore is an in-memory SessionStore for tests.
@@ -42,15 +49,7 @@ func (m *MemStore) Load(_ context.Context, id string) (*Session, error) {
 	if !ok {
 		return nil, fmt.Errorf("session %q not found", id)
 	}
-	cp := *s
-	cp.Messages = append([]message.Message(nil), s.Messages...)
-	if s.Values != nil {
-		cp.Values = make(map[string]any, len(s.Values))
-		for k, v := range s.Values {
-			cp.Values[k] = v
-		}
-	}
-	return &cp, nil
+	return cloneSession(s), nil
 }
 
 func (m *MemStore) Save(_ context.Context, s *Session) error {
@@ -59,6 +58,44 @@ func (m *MemStore) Save(_ context.Context, s *Session) error {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.data[s.ID] = cloneSession(s)
+	return nil
+}
+
+func (m *MemStore) Append(_ context.Context, id string, msgs ...message.Message) error {
+	if id == "" {
+		return fmt.Errorf("session: id is required")
+	}
+	if len(msgs) == 0 {
+		return nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	s := m.data[id]
+	if s == nil {
+		s = &Session{ID: id, Values: map[string]any{}}
+		m.data[id] = s
+	}
+	s.Messages = append(s.Messages, msgs...)
+	return nil
+}
+
+func (m *MemStore) ReplaceAll(_ context.Context, id string, msgs []message.Message) error {
+	if id == "" {
+		return fmt.Errorf("session: id is required")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	s := m.data[id]
+	if s == nil {
+		s = &Session{ID: id, Values: map[string]any{}}
+		m.data[id] = s
+	}
+	s.Messages = append([]message.Message(nil), msgs...)
+	return nil
+}
+
+func cloneSession(s *Session) *Session {
 	cp := *s
 	cp.Messages = append([]message.Message(nil), s.Messages...)
 	if s.Values != nil {
@@ -67,8 +104,7 @@ func (m *MemStore) Save(_ context.Context, s *Session) error {
 			cp.Values[k] = v
 		}
 	}
-	m.data[s.ID] = &cp
-	return nil
+	return &cp
 }
 
 // FileStore persists sessions as JSON under Dir.
@@ -114,6 +150,44 @@ func (f *FileStore) Save(ctx context.Context, s *Session) error {
 		return err
 	}
 	return os.WriteFile(f.path(s.ID), b, 0o644)
+}
+
+func (f *FileStore) Append(ctx context.Context, id string, msgs ...message.Message) error {
+	if id == "" {
+		return fmt.Errorf("session: id is required")
+	}
+	if len(msgs) == 0 {
+		return nil
+	}
+	s, err := f.loadOrEmpty(ctx, id)
+	if err != nil {
+		return err
+	}
+	s.Messages = append(s.Messages, msgs...)
+	return f.Save(ctx, s)
+}
+
+func (f *FileStore) ReplaceAll(ctx context.Context, id string, msgs []message.Message) error {
+	if id == "" {
+		return fmt.Errorf("session: id is required")
+	}
+	s, err := f.loadOrEmpty(ctx, id)
+	if err != nil {
+		return err
+	}
+	s.Messages = append([]message.Message(nil), msgs...)
+	return f.Save(ctx, s)
+}
+
+func (f *FileStore) loadOrEmpty(ctx context.Context, id string) (*Session, error) {
+	s, err := f.Load(ctx, id)
+	if err == nil {
+		return s, nil
+	}
+	if os.IsNotExist(err) || strings.Contains(err.Error(), "not found") {
+		return &Session{ID: id, Values: map[string]any{}}, nil
+	}
+	return nil, err
 }
 
 type sessionWire struct {

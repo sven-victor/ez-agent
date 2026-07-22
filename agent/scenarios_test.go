@@ -454,6 +454,61 @@ func TestAgentMemoryWindowPrepare(t *testing.T) {
 	}
 }
 
+func TestAgentSessionAppendAndReplaceAllAfterWindow(t *testing.T) {
+	store := memory.NewMemStore()
+	p := &scriptedProvider{fn: func(n int, req model.Request) (model.Result, error) {
+		return textResult("ok"), nil
+	}}
+	history := []message.Message{
+		message.NewUserText("m1"),
+		message.NewAssistantText("a1"),
+		message.NewUserText("m2"),
+		message.NewAssistantText("a2"),
+		message.NewUserText("m3"),
+	}
+	a, err := agent.New(
+		agent.WithProvider(p),
+		agent.WithContextPolicy(&memory.Window{MaxMessages: 3}),
+		agent.WithSession("win-sess", store),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.Run(context.Background(), run.Input{Messages: history}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.Load(context.Background(), "win-sess")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Effective window after Prepare trim + assistant reply should be bounded.
+	if len(got.Messages) > 4 {
+		t.Fatalf("session window too large: %d msgs %#v", len(got.Messages), got.Messages)
+	}
+	if message.TextContent(got.Messages[len(got.Messages)-1]) != "ok" {
+		t.Fatalf("last=%q", message.TextContent(got.Messages[len(got.Messages)-1]))
+	}
+
+	// Second run loads the trimmed window, not the original 5+ history.
+	p2 := &scriptedProvider{fn: func(n int, req model.Request) (model.Result, error) {
+		if len(req.Messages) > 5 {
+			t.Fatalf("loaded too much history into model: %d", len(req.Messages))
+		}
+		return textResult("again"), nil
+	}}
+	a2, err := agent.New(
+		agent.WithProvider(p2),
+		agent.WithContextPolicy(&memory.Window{MaxMessages: 3}),
+		agent.WithSession("win-sess", store),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a2.Run(context.Background(), run.Input{Text: "next"}); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestAgentMemoryWindowPreservesToolPairs(t *testing.T) {
 	p := &scriptedProvider{fn: func(n int, req model.Request) (model.Result, error) {
 		assertNoDanglingToolUse(t, req.Messages)

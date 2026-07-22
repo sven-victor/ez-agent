@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 	"time"
 
@@ -40,6 +41,10 @@ type Config struct {
 	ToolChoice      tool.Choice
 	CheckpointStore memory.CheckpointStore
 	CheckpointID    string
+	// SessionStore + SessionID persist the effective model window mid-run.
+	// Append on new messages; ReplaceAll after context Prepare/Reduce shrinks the window.
+	SessionStore memory.SessionStore
+	SessionID    string
 	// PreferComplete uses Provider.Complete instead of Stream for model calls.
 	PreferComplete bool
 }
@@ -122,14 +127,19 @@ func (l *Loop) Run(ctx context.Context, st *run.State, emit EmitFunc) (res *run.
 		}
 		select {
 		case <-ctx.Done():
-			res = l.finishCanceled(st)
+			res = l.finishCanceled(ctx, st)
 			_ = emit(event.Cancelled{})
 			_ = emit(event.RunFinished{Result: res})
 			return res, ctx.Err()
 		default:
 		}
 
+		beforePrepare := append([]message.Message(nil), st.Messages...)
 		if err := l.cfg.Policy.Prepare(ctx, st); err != nil {
+			_ = emit(event.RunError{Err: err})
+			return nil, err
+		}
+		if err := l.syncSessionWindow(ctx, beforePrepare, st.Messages); err != nil {
 			_ = emit(event.RunError{Err: err})
 			return nil, err
 		}
@@ -175,9 +185,14 @@ func (l *Loop) Run(ctx context.Context, st *run.State, emit EmitFunc) (res *run.
 					_ = emit(event.RunError{Err: fmt.Errorf("overflow retries exceeded: %w", err)})
 					return nil, err
 				}
+				beforeReduce := append([]message.Message(nil), st.Messages...)
 				if rerr := l.cfg.Policy.Reduce(ctx, st); rerr != nil {
 					_ = emit(event.RunError{Err: rerr})
 					return nil, rerr
+				}
+				if serr := l.syncSessionWindow(ctx, beforeReduce, st.Messages); serr != nil {
+					_ = emit(event.RunError{Err: serr})
+					return nil, serr
 				}
 				continue
 			}
@@ -186,7 +201,7 @@ func (l *Loop) Run(ctx context.Context, st *run.State, emit EmitFunc) (res *run.
 				if wait, ok := l.cfg.RetryPolicy.ShouldRetry(providerRetries, err); ok {
 					select {
 					case <-ctx.Done():
-						res = l.finishCanceled(st)
+						res = l.finishCanceled(ctx, st)
 						_ = emit(event.Cancelled{})
 						_ = emit(event.RunFinished{Result: res})
 						return res, ctx.Err()
@@ -197,7 +212,7 @@ func (l *Loop) Run(ctx context.Context, st *run.State, emit EmitFunc) (res *run.
 			}
 			select {
 			case <-ctx.Done():
-				res = l.finishCanceled(st)
+				res = l.finishCanceled(ctx, st)
 				_ = emit(event.Cancelled{})
 				_ = emit(event.RunFinished{Result: res})
 				return res, ctx.Err()
@@ -221,7 +236,10 @@ func (l *Loop) Run(ctx context.Context, st *run.State, emit EmitFunc) (res *run.
 				}
 				continue
 			}
-			st.AppendMessage(msg.Message)
+			if err := l.appendMessage(ctx, st, msg.Message); err != nil {
+				_ = emit(event.RunError{Err: err})
+				return nil, err
+			}
 			st.Usage.Add(msg.Usage)
 			res = stop(st, msg.StopReason)
 			res.Structured = structured
@@ -229,7 +247,10 @@ func (l *Loop) Run(ctx context.Context, st *run.State, emit EmitFunc) (res *run.
 			return res, nil
 		}
 
-		st.AppendMessage(msg.Message)
+		if err := l.appendMessage(ctx, st, msg.Message); err != nil {
+			_ = emit(event.RunError{Err: err})
+			return nil, err
+		}
 		st.Usage.Add(msg.Usage)
 
 		after := &hook.AfterModel{State: st, Result: msg}
@@ -240,6 +261,10 @@ func (l *Loop) Run(ctx context.Context, st *run.State, emit EmitFunc) (res *run.
 		if after.ReplaceMessage != nil {
 			st.ReplaceLastMessage(*after.ReplaceMessage)
 			msg.Message = *after.ReplaceMessage
+			if err := l.sessionReplaceAll(ctx, st.Messages); err != nil {
+				_ = emit(event.RunError{Err: err})
+				return nil, err
+			}
 		}
 		if after.Retry {
 			modelRetries++
@@ -252,7 +277,7 @@ func (l *Loop) Run(ctx context.Context, st *run.State, emit EmitFunc) (res *run.
 				if wait, ok := l.cfg.RetryPolicy.ShouldRetry(modelRetries, fmt.Errorf("after-model retry")); ok {
 					select {
 					case <-ctx.Done():
-						res = l.finishCanceled(st)
+						res = l.finishCanceled(ctx, st)
 						_ = emit(event.Cancelled{})
 						_ = emit(event.RunFinished{Result: res})
 						return res, ctx.Err()
@@ -261,6 +286,10 @@ func (l *Loop) Run(ctx context.Context, st *run.State, emit EmitFunc) (res *run.
 				}
 			}
 			st.PopLastMessage()
+			if err := l.sessionReplaceAll(ctx, st.Messages); err != nil {
+				_ = emit(event.RunError{Err: err})
+				return nil, err
+			}
 			continue
 		}
 		modelRetries = 0
@@ -310,6 +339,36 @@ func (l *Loop) saveCheckpoint(ctx context.Context, st *run.State) {
 	_ = l.cfg.CheckpointStore.Save(ctx, l.cfg.CheckpointID, st)
 }
 
+func (l *Loop) appendMessage(ctx context.Context, st *run.State, m message.Message) error {
+	st.AppendMessage(m)
+	return l.sessionAppend(ctx, m)
+}
+
+func (l *Loop) sessionAppend(ctx context.Context, msgs ...message.Message) error {
+	if l.cfg.SessionStore == nil || l.cfg.SessionID == "" || len(msgs) == 0 {
+		return nil
+	}
+	return l.cfg.SessionStore.Append(ctx, l.cfg.SessionID, msgs...)
+}
+
+func (l *Loop) sessionReplaceAll(ctx context.Context, msgs []message.Message) error {
+	if l.cfg.SessionStore == nil || l.cfg.SessionID == "" {
+		return nil
+	}
+	return l.cfg.SessionStore.ReplaceAll(ctx, l.cfg.SessionID, msgs)
+}
+
+func (l *Loop) syncSessionWindow(ctx context.Context, before, after []message.Message) error {
+	if sameMessages(before, after) {
+		return nil
+	}
+	return l.sessionReplaceAll(ctx, after)
+}
+
+func sameMessages(a, b []message.Message) bool {
+	return reflect.DeepEqual(a, b)
+}
+
 func (l *Loop) executePending(ctx context.Context, st *run.State, emit EmitFunc) error {
 	calls := make([]tool.Call, len(st.Pending.Calls))
 	for i, c := range st.Pending.Calls {
@@ -329,9 +388,15 @@ func (l *Loop) runTools(ctx context.Context, st *run.State, emit EmitFunc, calls
 			for i, call := range calls {
 				_ = emit(event.ToolFinished{Call: call, Result: results[i]})
 			}
-			st.AppendMessage(message.NewToolResultMessage(tool.ToMessageParts(results)...))
+			if aerr := l.appendMessage(ctx, st, message.NewToolResultMessage(tool.ToMessageParts(results)...)); aerr != nil {
+				_ = emit(event.RunError{Err: aerr})
+				return aerr
+			}
 		} else {
-			st.AppendMessage(syntheticErrorResults(calls, err))
+			if aerr := l.appendMessage(ctx, st, syntheticErrorResults(calls, err)); aerr != nil {
+				_ = emit(event.RunError{Err: aerr})
+				return aerr
+			}
 		}
 		select {
 		case <-ctx.Done():
@@ -346,8 +411,7 @@ func (l *Loop) runTools(ctx context.Context, st *run.State, emit EmitFunc, calls
 	for i, call := range calls {
 		_ = emit(event.ToolFinished{Call: call, Result: results[i]})
 	}
-	st.AppendMessage(message.NewToolResultMessage(tool.ToMessageParts(results)...))
-	return nil
+	return l.appendMessage(ctx, st, message.NewToolResultMessage(tool.ToMessageParts(results)...))
 }
 
 func pendingFromCalls(calls []tool.Call) *run.PendingTools {
@@ -493,7 +557,7 @@ func stop(st *run.State, reason run.StopReason) *run.Result {
 	}
 }
 
-func (l *Loop) finishCanceled(st *run.State) *run.Result {
+func (l *Loop) finishCanceled(ctx context.Context, st *run.State) *run.Result {
 	if n := len(st.Messages); n > 0 {
 		last := st.Messages[n-1]
 		uses := message.ToolUses(last)
@@ -506,7 +570,7 @@ func (l *Loop) finishCanceled(st *run.State) *run.Result {
 					Parts:     []message.Part{message.Text{Text: "canceled"}},
 				}
 			}
-			st.AppendMessage(message.NewToolResultMessage(results...))
+			_ = l.appendMessage(ctx, st, message.NewToolResultMessage(results...))
 		}
 	}
 	return stop(st, run.StopCanceled)

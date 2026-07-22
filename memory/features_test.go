@@ -161,6 +161,63 @@ func TestSessionMemRoundTrip(t *testing.T) {
 	}
 }
 
+func TestSessionAppendReplaceAll(t *testing.T) {
+	ctx := context.Background()
+	store := memory.NewMemStore()
+
+	if err := store.Append(ctx, "s1", message.NewUserText("a"), message.NewAssistantText("b")); err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.Load(ctx, "s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Messages) != 2 {
+		t.Fatalf("after append: %d", len(got.Messages))
+	}
+
+	if err := store.Append(ctx, "s1", message.NewUserText("c")); err != nil {
+		t.Fatal(err)
+	}
+	got, err = store.Load(ctx, "s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Messages) != 3 {
+		t.Fatalf("after second append: %d", len(got.Messages))
+	}
+
+	window := []message.Message{message.NewUserText("summary"), message.NewUserText("c")}
+	if err := store.ReplaceAll(ctx, "s1", window); err != nil {
+		t.Fatal(err)
+	}
+	got, err = store.Load(ctx, "s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Messages) != 2 || message.TextContent(got.Messages[0]) != "summary" {
+		t.Fatalf("after replace: %#v", got.Messages)
+	}
+}
+
+func TestSessionFileAppendReplaceAll(t *testing.T) {
+	ctx := context.Background()
+	store := &memory.FileStore{Dir: t.TempDir()}
+	if err := store.Append(ctx, "f1", message.NewUserText("one")); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ReplaceAll(ctx, "f1", []message.Message{message.NewUserText("only")}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.Load(ctx, "f1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Messages) != 1 || message.TextContent(got.Messages[0]) != "only" {
+		t.Fatalf("got %#v", got.Messages)
+	}
+}
+
 func TestSessionFileRoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	store := &memory.FileStore{Dir: dir}

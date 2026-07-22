@@ -66,17 +66,17 @@ func main() {
 	flag.Parse()
 
 	cfg := demoConfig{
-		Prompt:            *prompt,
-		ModelID:           *modelID,
-		ProviderName:      *providerName,
-		SessionID:         *sessionID,
-		MaxTurns:          *maxTurns,
-		SummarizeAt:       *summarizeAt,
-		SummaryKeep:       *summaryKeep,
-		SummarizeTokens:   *summarizeTokens,
-		NoSummarize:       *noSummarize,
-		SegmentedSummary:  *segmentedSummary,
-		MCP:               mcpCfg,
+		Prompt:           *prompt,
+		ModelID:          *modelID,
+		ProviderName:     *providerName,
+		SessionID:        *sessionID,
+		MaxTurns:         *maxTurns,
+		SummarizeAt:      *summarizeAt,
+		SummaryKeep:      *summaryKeep,
+		SummarizeTokens:  *summarizeTokens,
+		NoSummarize:      *noSummarize,
+		SegmentedSummary: *segmentedSummary,
+		MCP:              mcpCfg,
 	}
 	if err := realMain(cfg); err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)

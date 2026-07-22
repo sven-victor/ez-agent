@@ -425,7 +425,7 @@ Registers tools `remember` and `search_memory`.
 
 ## Context / memory
 
-`State` keeps a full `Transcript` (returned in `Result.Messages` / Session) and a model `Messages` window. Policies only mutate `Messages`.
+`State` keeps an in-run `Transcript` (returned in `Result.Messages`) and a model `Messages` window. Policies only mutate `Messages`. With `WithSession`, the store persists the **effective window** (`Messages`): the loop `Append`s new turns and `ReplaceAll`s after summarize/trim.
 
 ```go
 agent.WithContextPolicy(memory.Noop{})
@@ -460,6 +460,8 @@ agent.WithContextPolicy(&memory.DegradeMedia{
 })
 
 agent.WithSession("id", &memory.FileStore{Dir: ".sessions"})
+// SessionStore.Append / ReplaceAll keep the effective window mid-run;
+// Save at end also writes Messages (not full Transcript).
 // or memory.NewMemStore() for tests
 
 agent.WithCheckpoint("run-1", memory.NewMemCheckpointStore())

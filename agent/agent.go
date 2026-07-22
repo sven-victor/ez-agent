@@ -139,6 +139,8 @@ func WithContextPolicy(p memory.ContextPolicy) Option {
 }
 
 // WithSession enables Load before Run and Save after Run for the given session id.
+// Mid-run, the loop Appends new messages and ReplaceAlls after context reduction
+// so the store tracks the effective model window.
 func WithSession(id string, store memory.SessionStore) Option {
 	return func(c *config) error {
 		if id == "" || store == nil {
@@ -292,6 +294,8 @@ func (a *Agent) rebuildLoop() {
 		ToolChoice:      a.toolChoice,
 		CheckpointStore: a.checkpointStore,
 		CheckpointID:    a.checkpointID,
+		SessionStore:    a.sessionStore,
+		SessionID:       a.sessionID,
 		PreferComplete:  a.preferComplete,
 	})
 }
@@ -432,10 +436,20 @@ func (a *Agent) beginState(ctx context.Context, in run.Input) (*run.State, error
 			for _, m := range incoming {
 				st.AppendMessage(m)
 			}
+			if len(incoming) > 0 {
+				if err := a.sessionStore.Append(ctx, a.sessionID, incoming...); err != nil {
+					return nil, err
+				}
+			}
 			return st, nil
 		}
 	}
 	st.InitHistory(incoming)
+	if a.sessionStore != nil && a.sessionID != "" && len(incoming) > 0 {
+		if err := a.sessionStore.Append(ctx, a.sessionID, incoming...); err != nil {
+			return nil, err
+		}
+	}
 	return st, nil
 }
 
@@ -447,9 +461,10 @@ func (a *Agent) saveSession(ctx context.Context, st *run.State) error {
 	if a.sessionStore == nil || a.sessionID == "" {
 		return nil
 	}
+	// Persist the effective model window (post-summarize / trim), not the full transcript.
 	return a.sessionStore.Save(ctx, &memory.Session{
 		ID:       a.sessionID,
-		Messages: append([]message.Message(nil), st.Transcript...),
+		Messages: append([]message.Message(nil), st.Messages...),
 		Values:   st.Values,
 	})
 }

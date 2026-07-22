@@ -57,8 +57,9 @@ type PendingCall struct {
 
 // State is the typed runtime state for a single Run.
 //
-// Transcript is the full conversation (Session truth). Messages is the model
-// window; ContextPolicy may trim or summarize Messages only.
+// Transcript is the in-run conversation log (Result.Messages). Messages is the
+// model window; ContextPolicy may trim or summarize Messages only.
+// When SessionStore is enabled, it persists Messages (the effective window).
 type State struct {
 	Transcript []message.Message
 	Messages   []message.Message
