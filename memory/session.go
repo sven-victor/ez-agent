@@ -24,6 +24,10 @@ type Session struct {
 // Messages are the effective model window (post-summarize / trim), not a
 // forever-growing transcript. Append grows that window; ReplaceAll replaces it
 // after context reduction (summarize / window trim).
+//
+// Each message should carry a stable Message.ID (assigned on Append when empty)
+// so SQL adapters can map one message to one row. ReplaceAll after summarize
+// typically introduces a new summary ID while recent messages keep theirs.
 type SessionStore interface {
 	Load(ctx context.Context, id string) (*Session, error)
 	Save(ctx context.Context, s *Session) error
@@ -58,7 +62,9 @@ func (m *MemStore) Save(_ context.Context, s *Session) error {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.data[s.ID] = cloneSession(s)
+	cp := cloneSession(s)
+	message.EnsureIDs(cp.Messages)
+	m.data[s.ID] = cp
 	return nil
 }
 
@@ -76,7 +82,7 @@ func (m *MemStore) Append(_ context.Context, id string, msgs ...message.Message)
 		s = &Session{ID: id, Values: map[string]any{}}
 		m.data[id] = s
 	}
-	s.Messages = append(s.Messages, msgs...)
+	s.Messages = append(s.Messages, cloneMessagesWithIDs(msgs)...)
 	return nil
 }
 
@@ -91,7 +97,7 @@ func (m *MemStore) ReplaceAll(_ context.Context, id string, msgs []message.Messa
 		s = &Session{ID: id, Values: map[string]any{}}
 		m.data[id] = s
 	}
-	s.Messages = append([]message.Message(nil), msgs...)
+	s.Messages = cloneMessagesWithIDs(msgs)
 	return nil
 }
 
@@ -105,6 +111,12 @@ func cloneSession(s *Session) *Session {
 		}
 	}
 	return &cp
+}
+
+func cloneMessagesWithIDs(msgs []message.Message) []message.Message {
+	out := append([]message.Message(nil), msgs...)
+	message.EnsureIDs(out)
+	return out
 }
 
 // FileStore persists sessions as JSON under Dir.
@@ -139,12 +151,13 @@ func (f *FileStore) Save(ctx context.Context, s *Session) error {
 	if err := os.MkdirAll(f.Dir, 0o755); err != nil {
 		return err
 	}
+	msgs := cloneMessagesWithIDs(s.Messages)
 	blobDir := filepath.Join(f.Dir, s.ID+"_blobs")
-	msgs, err := encodeMessagesForStore(s.Messages, blobDir)
+	encoded, err := encodeMessagesForStore(msgs, blobDir)
 	if err != nil {
 		return err
 	}
-	wire := sessionWire{ID: s.ID, Messages: msgs, Values: s.Values}
+	wire := sessionWire{ID: s.ID, Messages: encoded, Values: s.Values}
 	b, err := json.MarshalIndent(wire, "", "  ")
 	if err != nil {
 		return err
@@ -163,7 +176,7 @@ func (f *FileStore) Append(ctx context.Context, id string, msgs ...message.Messa
 	if err != nil {
 		return err
 	}
-	s.Messages = append(s.Messages, msgs...)
+	s.Messages = append(s.Messages, cloneMessagesWithIDs(msgs)...)
 	return f.Save(ctx, s)
 }
 
@@ -175,7 +188,7 @@ func (f *FileStore) ReplaceAll(ctx context.Context, id string, msgs []message.Me
 	if err != nil {
 		return err
 	}
-	s.Messages = append([]message.Message(nil), msgs...)
+	s.Messages = cloneMessagesWithIDs(msgs)
 	return f.Save(ctx, s)
 }
 

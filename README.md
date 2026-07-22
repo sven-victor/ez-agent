@@ -425,7 +425,7 @@ Registers tools `remember` and `search_memory`.
 
 ## Context / memory
 
-`State` keeps an in-run `Transcript` (returned in `Result.Messages`) and a model `Messages` window. Policies only mutate `Messages`. With `WithSession`, the store persists the **effective window** (`Messages`): the loop `Append`s new turns and `ReplaceAll`s after summarize/trim.
+`State` keeps an in-run `Transcript` (returned in `Result.Messages`) and a model `Messages` window. Policies only mutate `Messages`. With `WithSession`, the store persists the **effective window** (`Messages`): the loop `Append`s new turns and `ReplaceAll`s after summarize/trim. Each `message.Message` may carry an optional stable `ID` (UUID; assigned on Append when empty) so SQL adapters can store one row per message—summaries get a new ID, recent messages keep theirs across `ReplaceAll`.
 
 ```go
 agent.WithContextPolicy(memory.Noop{})

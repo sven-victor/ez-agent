@@ -422,6 +422,8 @@ func sendEvent(ctx context.Context, ch chan<- event.Event, ev event.Event) error
 func (a *Agent) beginState(ctx context.Context, in run.Input) (*run.State, error) {
 	st := &run.State{Values: map[string]any{}}
 	incoming := run.MessagesFromInput(in)
+	message.EnsureIDs(incoming)
+
 	if a.sessionStore != nil && a.sessionID != "" {
 		sess, err := a.sessionStore.Load(ctx, a.sessionID)
 		if err != nil {
@@ -429,7 +431,14 @@ func (a *Agent) beginState(ctx context.Context, in run.Input) (*run.State, error
 				return nil, err
 			}
 		} else {
-			st.InitHistory(sess.Messages)
+			msgs := sess.Messages
+			if message.EnsureIDs(msgs) {
+				// Backfill IDs for sessions persisted before Message.ID existed.
+				if err := a.sessionStore.ReplaceAll(ctx, a.sessionID, msgs); err != nil {
+					return nil, err
+				}
+			}
+			st.InitHistory(msgs)
 			if sess.Values != nil {
 				st.Values = sess.Values
 			}
@@ -461,6 +470,7 @@ func (a *Agent) saveSession(ctx context.Context, st *run.State) error {
 	if a.sessionStore == nil || a.sessionID == "" {
 		return nil
 	}
+	message.EnsureIDs(st.Messages)
 	// Persist the effective model window (post-summarize / trim), not the full transcript.
 	return a.sessionStore.Save(ctx, &memory.Session{
 		ID:       a.sessionID,

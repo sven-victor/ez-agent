@@ -488,6 +488,16 @@ func TestAgentSessionAppendAndReplaceAllAfterWindow(t *testing.T) {
 	if message.TextContent(got.Messages[len(got.Messages)-1]) != "ok" {
 		t.Fatalf("last=%q", message.TextContent(got.Messages[len(got.Messages)-1]))
 	}
+	ids := map[string]bool{}
+	for _, m := range got.Messages {
+		if m.ID == "" {
+			t.Fatal("session message missing ID")
+		}
+		if ids[m.ID] {
+			t.Fatalf("duplicate message ID %q", m.ID)
+		}
+		ids[m.ID] = true
+	}
 
 	// Second run loads the trimmed window, not the original 5+ history.
 	p2 := &scriptedProvider{fn: func(n int, req model.Request) (model.Result, error) {

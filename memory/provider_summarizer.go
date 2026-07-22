@@ -40,6 +40,7 @@ func (p *ProviderSummarizer) Summarize(ctx context.Context, msgs []message.Messa
 		return message.Message{}, fmt.Errorf("provider summarizer: empty summary")
 	}
 	return message.Message{
+		ID:    message.NewID(),
 		Role:  message.RoleUser,
 		Parts: []message.Part{message.Text{Text: "[Conversation summary]\n" + text}},
 	}, nil

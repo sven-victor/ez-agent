@@ -17,6 +17,7 @@ func CondenseOversizedParts(msgs []message.Message, maxBytes int) []message.Mess
 	out := make([]message.Message, len(msgs))
 	for i, m := range msgs {
 		out[i] = message.Message{
+			ID:    m.ID,
 			Role:  m.Role,
 			Parts: condenseParts(m.Parts, maxBytes),
 		}
@@ -140,6 +141,7 @@ func flattenMessagesText(msgs []message.Message) string {
 
 func summaryMessage(text string) message.Message {
 	return message.Message{
+		ID:    message.NewID(),
 		Role:  message.RoleUser,
 		Parts: []message.Part{message.Text{Text: text}},
 	}

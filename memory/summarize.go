@@ -166,6 +166,7 @@ func (s *Summarize) summarizeOldest(ctx context.Context, st *run.State, allowSeg
 	if summary.Role == "" {
 		summary.Role = message.RoleUser
 	}
+	message.EnsureID(&summary)
 	st.Messages = append([]message.Message{summary}, remaining...)
 	return nil
 }

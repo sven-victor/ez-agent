@@ -136,6 +136,45 @@ func TestSummarizeProactivePrepare(t *testing.T) {
 	}
 }
 
+func TestSummarizeAssignsNewIDKeepsRecentIDs(t *testing.T) {
+	st := &run.State{}
+	var msgs []message.Message
+	for i := 0; i < 12; i++ {
+		m := message.NewUserText("m")
+		m.ID = message.NewID()
+		msgs = append(msgs, m)
+	}
+	keep := msgs[len(msgs)-3].ID
+	st.InitHistory(msgs)
+	pol := &memory.Summarize{
+		Summarizer:           &memory.ProviderSummarizer{Provider: fakeSumProvider{}},
+		KeepRecent:           3,
+		Ratio:                0.5,
+		ProactiveMaxMessages: 5,
+	}
+	if err := pol.Prepare(context.Background(), st); err != nil {
+		t.Fatal(err)
+	}
+	if st.Messages[0].ID == "" {
+		t.Fatal("summary missing ID")
+	}
+	found := false
+	for _, m := range st.Messages[1:] {
+		if m.ID == keep {
+			found = true
+		}
+		if m.ID == "" {
+			t.Fatal("recent message lost ID")
+		}
+	}
+	if !found {
+		t.Fatalf("expected recent id %q in window %#v", keep, st.Messages)
+	}
+	if st.Messages[0].ID == keep {
+		t.Fatal("summary should not reuse a recent message ID")
+	}
+}
+
 func TestSessionMemRoundTrip(t *testing.T) {
 	store := memory.NewMemStore()
 	s := &memory.Session{
@@ -175,6 +214,12 @@ func TestSessionAppendReplaceAll(t *testing.T) {
 	if len(got.Messages) != 2 {
 		t.Fatalf("after append: %d", len(got.Messages))
 	}
+	for i, m := range got.Messages {
+		if m.ID == "" {
+			t.Fatalf("message %d missing ID", i)
+		}
+	}
+	keepID := got.Messages[1].ID
 
 	if err := store.Append(ctx, "s1", message.NewUserText("c")); err != nil {
 		t.Fatal(err)
@@ -187,7 +232,10 @@ func TestSessionAppendReplaceAll(t *testing.T) {
 		t.Fatalf("after second append: %d", len(got.Messages))
 	}
 
-	window := []message.Message{message.NewUserText("summary"), message.NewUserText("c")}
+	window := []message.Message{
+		{ID: "sum-1", Role: message.RoleUser, Parts: []message.Part{message.Text{Text: "summary"}}},
+		{ID: keepID, Role: message.RoleUser, Parts: []message.Part{message.Text{Text: "c"}}},
+	}
 	if err := store.ReplaceAll(ctx, "s1", window); err != nil {
 		t.Fatal(err)
 	}
@@ -195,7 +243,7 @@ func TestSessionAppendReplaceAll(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got.Messages) != 2 || message.TextContent(got.Messages[0]) != "summary" {
+	if len(got.Messages) != 2 || got.Messages[0].ID != "sum-1" || got.Messages[1].ID != keepID {
 		t.Fatalf("after replace: %#v", got.Messages)
 	}
 }

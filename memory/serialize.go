@@ -12,6 +12,7 @@ import (
 )
 
 type wireMessage struct {
+	ID    string     `json:"id,omitempty"`
 	Role  string     `json:"role"`
 	Parts []wirePart `json:"parts"`
 }
@@ -39,7 +40,7 @@ type wirePart struct {
 func encodeMessagesForStore(msgs []message.Message, blobDir string) ([]wireMessage, error) {
 	out := make([]wireMessage, 0, len(msgs))
 	for _, m := range msgs {
-		wm := wireMessage{Role: string(m.Role)}
+		wm := wireMessage{ID: m.ID, Role: string(m.Role)}
 		for _, p := range m.Parts {
 			wp, err := encodePart(p, blobDir)
 			if err != nil {
@@ -126,7 +127,7 @@ func encodeBlobPart(typ string, b message.Blob, detail string, dur time.Duration
 func decodeMessages(msgs []wireMessage) ([]message.Message, error) {
 	out := make([]message.Message, 0, len(msgs))
 	for _, wm := range msgs {
-		m := message.Message{Role: message.Role(wm.Role)}
+		m := message.Message{ID: wm.ID, Role: message.Role(wm.Role)}
 		for _, wp := range wm.Parts {
 			p, err := decodePart(wp)
 			if err != nil {

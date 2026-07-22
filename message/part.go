@@ -14,7 +14,13 @@ const (
 )
 
 // Message is a single turn entry in the conversation.
+//
+// ID is an optional stable identifier for persistence (one row per message in
+// SQL stores). Empty means "not yet assigned"; SessionStore / the agent loop
+// assign IDs on Append. Summaries get a new ID; Replace keeps the prior ID when
+// the replacement leaves ID empty.
 type Message struct {
+	ID    string // optional; UUID recommended for external stores
 	Role  Role
 	Parts []Part
 }

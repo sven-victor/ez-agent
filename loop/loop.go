@@ -259,8 +259,13 @@ func (l *Loop) Run(ctx context.Context, st *run.State, emit EmitFunc) (res *run.
 			return nil, err
 		}
 		if after.ReplaceMessage != nil {
-			st.ReplaceLastMessage(*after.ReplaceMessage)
-			msg.Message = *after.ReplaceMessage
+			rm := *after.ReplaceMessage
+			if rm.ID == "" && len(st.Messages) > 0 {
+				rm.ID = st.Messages[len(st.Messages)-1].ID
+			}
+			message.EnsureID(&rm)
+			st.ReplaceLastMessage(rm)
+			msg.Message = rm
 			if err := l.sessionReplaceAll(ctx, st.Messages); err != nil {
 				_ = emit(event.RunError{Err: err})
 				return nil, err
@@ -340,6 +345,7 @@ func (l *Loop) saveCheckpoint(ctx context.Context, st *run.State) {
 }
 
 func (l *Loop) appendMessage(ctx context.Context, st *run.State, m message.Message) error {
+	message.EnsureID(&m)
 	st.AppendMessage(m)
 	return l.sessionAppend(ctx, m)
 }
@@ -355,6 +361,7 @@ func (l *Loop) sessionReplaceAll(ctx context.Context, msgs []message.Message) er
 	if l.cfg.SessionStore == nil || l.cfg.SessionID == "" {
 		return nil
 	}
+	message.EnsureIDs(msgs)
 	return l.cfg.SessionStore.ReplaceAll(ctx, l.cfg.SessionID, msgs)
 }
 
