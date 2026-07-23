@@ -91,7 +91,8 @@ Runnable demo (loads `.env` automatically; see `.env.example`):
 ```bash
 cp .env.example .env   # then fill in API_KEY
 
-go run ./cmd/demo                                          # interactive REPL
+go run ./cmd/demo                                          # interactive REPL (terminal)
+go run ./cmd/demo -ui tui                                  # interactive multi-pane TUI
 go run ./cmd/demo -prompt "What time is it?"               # one-shot, then exit
 go run ./cmd/demo -max-turns 10                            # per-message loop cap (default 20, 0=unlimited)
 go run ./cmd/demo -summarize-at 40 -summary-keep 10         # auto-summarize model window (default)

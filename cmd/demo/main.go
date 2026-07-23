@@ -9,7 +9,8 @@
 //
 // Usage:
 //
-//	go run ./cmd/demo                              # interactive REPL
+//	go run ./cmd/demo                              # interactive REPL (terminal)
+//	go run ./cmd/demo -ui tui                       # interactive TUI
 //	go run ./cmd/demo -prompt "What time is it?"   # one-shot, then exit
 //	go run ./cmd/demo -max-turns 10                # per-message tool/model loop cap (0=unlimited)
 //	go run ./cmd/demo -summarize-at 40             # auto-summarize when window exceeds N messages
@@ -53,6 +54,7 @@ func main() {
 	noSummarize := flag.Bool("no-summarize", false, "disable automatic context summarization")
 	segmentedSummary := flag.Bool("segmented-summary", false, "enable tool-driven segmented summarization fallback on overflow")
 	logLevel := flag.String("log-level", "info", "framework log level: debug|info|warn|error|off")
+	uiMode := flag.String("ui", "terminal", "interactive UI: terminal | tui")
 
 	var mcpCfg mcpConfig
 	flag.StringVar(&mcpCfg.ConfigFile, "mcp-config", "", "MCP servers JSON file (mcpServers; FastMCP/Cursor style)")
@@ -82,6 +84,7 @@ func main() {
 		NoSummarize:      *noSummarize,
 		SegmentedSummary: *segmentedSummary,
 		LogLevel:         *logLevel,
+		UI:               strings.ToLower(strings.TrimSpace(*uiMode)),
 		MCP:              mcpCfg,
 	}
 	if err := realMain(cfg); err != nil {
@@ -102,6 +105,8 @@ type demoConfig struct {
 	NoSummarize      bool
 	SegmentedSummary bool
 	LogLevel         string
+	UI               string // terminal | tui
+	Logger           logger.Logger
 	MCP              mcpConfig
 }
 
@@ -117,6 +122,11 @@ func realMain(cfg demoConfig) error {
 	}
 	if cfg.SummaryKeep < 1 {
 		return fmt.Errorf("-summary-keep must be >= 1")
+	}
+	switch cfg.UI {
+	case "", "terminal", "tui":
+	default:
+		return fmt.Errorf("unknown -ui %q (want terminal|tui)", cfg.UI)
 	}
 
 	wd, err := os.Getwd()
@@ -154,11 +164,55 @@ func realMain(cfg demoConfig) error {
 		sid = "demo"
 	}
 
+	useTUI := interactive && cfg.UI == "tui"
+	var logCh chan string
+	if useTUI {
+		logCh = make(chan string, 256)
+		cfg.Logger = newTUILogger(cfg.LogLevel, logCh)
+	}
+
 	a, toolNames, err := buildAgent(wd, pc, sid, cfg, mcp)
 	if err != nil {
 		return err
 	}
 
+	meta := sessionMeta{
+		Provider:  pc.name,
+		Model:     pc.model,
+		SessionID: sid,
+		MaxTurns:  cfg.MaxTurns,
+		MCP:       mcpStatus(mcp),
+	}
+
+	if !useTUI {
+		printBanner(pc, sid, mcp, cfg)
+	}
+
+	if interactive {
+		if useTUI {
+			return runTUI(ctx, a, toolNames, meta, logCh)
+		}
+		return runInteractive(ctx, a, toolNames)
+	}
+	return runOnce(ctx, a, cfg.Prompt)
+}
+
+type sessionMeta struct {
+	Provider  string
+	Model     string
+	SessionID string
+	MaxTurns  int
+	MCP       string
+}
+
+func mcpStatus(mcp *mcpBundle) string {
+	if mcp == nil || len(mcp.clients) == 0 {
+		return "off"
+	}
+	return fmt.Sprintf("ok (%d)", len(mcp.clients))
+}
+
+func printBanner(pc providerCase, sid string, mcp *mcpBundle, cfg demoConfig) {
 	fmt.Printf("provider: %s\n", pc.name)
 	fmt.Printf("model:    %s\n", pc.model)
 	if sid != "" {
@@ -191,11 +245,6 @@ func realMain(cfg demoConfig) error {
 		fmt.Printf("summarize: %s\n", strings.Join(parts, ", "))
 	}
 	fmt.Println()
-
-	if interactive {
-		return runInteractive(ctx, a, toolNames)
-	}
-	return runOnce(ctx, a, cfg.Prompt)
 }
 
 type providerCase struct {
@@ -236,7 +285,9 @@ Be concise unless the user asks for detail.`
 		agent.WithTools(builtinTools()...),
 		agent.WithLimits(run.Limits{MaxTurns: cfg.MaxTurns}),
 	}
-	if log := demoLogger(cfg.LogLevel); log != nil {
+	if cfg.Logger != nil {
+		opts = append(opts, agent.WithLogger(cfg.Logger))
+	} else if log := demoLogger(cfg.LogLevel); log != nil {
 		opts = append(opts, agent.WithLogger(log))
 	}
 	if !cfg.NoSummarize {
