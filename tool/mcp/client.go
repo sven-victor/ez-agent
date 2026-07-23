@@ -5,9 +5,13 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"os"
+	"os/exec"
+	"sort"
 	"sync"
 
 	mcpclient "github.com/mark3labs/mcp-go/client"
+	"github.com/mark3labs/mcp-go/client/transport"
 	"github.com/mark3labs/mcp-go/mcp"
 
 	"github.com/sven-victor/ez-agent/message"
@@ -26,16 +30,43 @@ type Client struct {
 
 // DialStdio connects to an MCP server over stdio (command + args).
 func DialStdio(ctx context.Context, command string, args ...string) (*Client, error) {
-	inner, err := mcpclient.NewStdioMCPClient(command, nil, args...)
+	return DialStdioOpts(ctx, command, args)
+}
+
+// DialStdioOpts connects over stdio with optional env / cwd / prefix.
+func DialStdioOpts(ctx context.Context, command string, args []string, opts ...Option) (*Client, error) {
+	o := applyOptions(opts)
+	env := envSlice(o.env)
+
+	var inner *mcpclient.Client
+	var err error
+	if o.cwd != "" {
+		cwd := o.cwd
+		inner, err = mcpclient.NewStdioMCPClientWithOptions(command, env, args, transport.WithCommandFunc(
+			func(ctx context.Context, command string, env []string, args []string) (*exec.Cmd, error) {
+				cmd := exec.CommandContext(ctx, command, args...)
+				cmd.Env = append(os.Environ(), env...)
+				cmd.Dir = cwd
+				return cmd, nil
+			},
+		))
+	} else {
+		inner, err = mcpclient.NewStdioMCPClient(command, env, args...)
+	}
 	if err != nil {
 		return nil, err
 	}
-	return wrapAndInit(ctx, inner, "")
+	return wrapAndInit(ctx, inner, o.prefix)
 }
 
 // DialHTTP connects to an MCP server over streamable HTTP.
-func DialHTTP(ctx context.Context, url string) (*Client, error) {
-	inner, err := mcpclient.NewStreamableHttpClient(url)
+func DialHTTP(ctx context.Context, url string, opts ...Option) (*Client, error) {
+	o := applyOptions(opts)
+	var httpOpts []transport.StreamableHTTPCOption
+	if h := o.httpHeaders(); len(h) > 0 {
+		httpOpts = append(httpOpts, transport.WithHTTPHeaders(h))
+	}
+	inner, err := mcpclient.NewStreamableHttpClient(url, httpOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -43,12 +74,17 @@ func DialHTTP(ctx context.Context, url string) (*Client, error) {
 		_ = inner.Close()
 		return nil, err
 	}
-	return wrapAndInit(ctx, inner, "")
+	return wrapAndInit(ctx, inner, o.prefix)
 }
 
 // DialSSE connects to an MCP server over SSE transport.
-func DialSSE(ctx context.Context, url string) (*Client, error) {
-	inner, err := mcpclient.NewSSEMCPClient(url)
+func DialSSE(ctx context.Context, url string, opts ...Option) (*Client, error) {
+	o := applyOptions(opts)
+	var sseOpts []transport.ClientOption
+	if h := o.httpHeaders(); len(h) > 0 {
+		sseOpts = append(sseOpts, mcpclient.WithHeaders(h))
+	}
+	inner, err := mcpclient.NewSSEMCPClient(url, sseOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -56,7 +92,50 @@ func DialSSE(ctx context.Context, url string) (*Client, error) {
 		_ = inner.Close()
 		return nil, err
 	}
-	return wrapAndInit(ctx, inner, "")
+	return wrapAndInit(ctx, inner, o.prefix)
+}
+
+// DialServer connects using a named ServerConfig from an MCP JSON config.
+// Tool names are prefixed with "<name>_".
+func DialServer(ctx context.Context, name string, srv ServerConfig) (*Client, error) {
+	kind, err := srv.kind()
+	if err != nil {
+		return nil, fmt.Errorf("mcp server %q: %w", name, err)
+	}
+	opts := srv.dialOptions(name)
+	switch kind {
+	case transportStdio:
+		return DialStdioOpts(ctx, srv.Command, srv.Args, opts...)
+	case transportHTTP:
+		return DialHTTP(ctx, srv.URL, opts...)
+	case transportSSE:
+		return DialSSE(ctx, srv.URL, opts...)
+	default:
+		return nil, fmt.Errorf("mcp server %q: unsupported transport %q", name, kind)
+	}
+}
+
+// DialConfig connects to every server in cfg. On any failure, already-opened clients are closed.
+// Servers are dialed in sorted name order.
+func DialConfig(ctx context.Context, cfg Config) ([]*Client, error) {
+	names := make([]string, 0, len(cfg.MCPServers))
+	for name := range cfg.MCPServers {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	clients := make([]*Client, 0, len(names))
+	for _, name := range names {
+		c, err := DialServer(ctx, name, cfg.MCPServers[name])
+		if err != nil {
+			for _, opened := range clients {
+				_ = opened.Close()
+			}
+			return nil, fmt.Errorf("mcp server %q: %w", name, err)
+		}
+		clients = append(clients, c)
+	}
+	return clients, nil
 }
 
 // DialInProcess wraps an already-constructed mcp-go client (e.g. in-process for tests).

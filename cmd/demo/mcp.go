@@ -8,15 +8,16 @@ import (
 	ezmcp "github.com/sven-victor/ez-agent/tool/mcp"
 )
 
-// mcpConfig holds optional MCP server endpoints from CLI flags.
+// mcpConfig holds optional MCP servers from CLI flags and/or a JSON config file.
 type mcpConfig struct {
-	Stdio []string // each: "command arg1 arg2..."
-	HTTP  []string
-	SSE   []string
+	ConfigFile string   // path to mcpServers JSON (FastMCP / Cursor style)
+	Stdio      []string // each: "command arg1 arg2..."
+	HTTP       []string
+	SSE        []string
 }
 
 func (c mcpConfig) empty() bool {
-	return len(c.Stdio) == 0 && len(c.HTTP) == 0 && len(c.SSE) == 0
+	return c.ConfigFile == "" && len(c.Stdio) == 0 && len(c.HTTP) == 0 && len(c.SSE) == 0
 }
 
 type mcpBundle struct {
@@ -38,6 +39,18 @@ func connectMCP(ctx context.Context, cfg mcpConfig) (*mcpBundle, error) {
 		}
 		b.clients = append(b.clients, c)
 		return nil
+	}
+
+	if cfg.ConfigFile != "" {
+		fileCfg, err := ezmcp.LoadConfigFile(cfg.ConfigFile)
+		if err != nil {
+			return nil, fmt.Errorf("mcp-config %q: %w", cfg.ConfigFile, err)
+		}
+		clients, err := ezmcp.DialConfig(ctx, fileCfg)
+		if err != nil {
+			return nil, fmt.Errorf("mcp-config %q: %w", cfg.ConfigFile, err)
+		}
+		b.clients = append(b.clients, clients...)
 	}
 
 	for i, raw := range cfg.Stdio {

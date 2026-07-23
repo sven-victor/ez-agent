@@ -100,7 +100,30 @@ go run ./cmd/demo -no-summarize                             # disable summarizat
 go run ./cmd/demo -provider anthropic -session chat1
 go run ./cmd/demo -mcp-stdio "npx -y @modelcontextprotocol/server-everything"
 go run ./cmd/demo -mcp-http http://localhost:8080/mcp
+go run ./cmd/demo -mcp-config mcp.json   # mcpServers JSON (HTTP headers, stdio env, …)
 ```
+
+Example `mcp.json` (FastMCP / Cursor canonical `mcpServers` format):
+
+```json
+{
+  "mcpServers": {
+    "devops": {
+      "type": "http",
+      "url": "https://example.com/mcp",
+      "headers": {
+        "Authorization": "Bearer ..."
+      }
+    },
+    "local": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-everything"]
+    }
+  }
+}
+```
+
+Config-file servers prefix tool names with `<server>_` (e.g. `devops_list_pods`).
 
 Built-in tools: `current_time`, `format_time`, `random_string`. Slash commands in the REPL: `/help`, `/tools`, `/quit`.
 
@@ -522,9 +545,10 @@ Invalid JSON from the model triggers a capped AfterModel-style retry inside the 
 import ezmcp "github.com/sven-victor/ez-agent/tool/mcp"
 
 client, err := ezmcp.DialStdio(ctx, "npx", "-y", "@modelcontextprotocol/server-everything")
-// or ezmcp.DialHTTP(ctx, "http://localhost:8080/mcp")
+// or ezmcp.DialHTTP(ctx, "http://localhost:8080/mcp", ezmcp.WithHeaders(map[string]string{"Authorization": "Bearer …"}))
 // or ezmcp.DialSSE(ctx, "http://localhost:8080/sse")
 // or ezmcp.DialInProcess(ctx, mcpGoClient, "prefix_") // tests / embedded
+// or cfg, _ := ezmcp.LoadConfigFile("mcp.json"); clients, _ := ezmcp.DialConfig(ctx, cfg)
 defer client.Close()
 
 a, err := agent.New(

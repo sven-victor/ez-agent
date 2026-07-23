@@ -19,6 +19,7 @@
 //	go run ./cmd/demo -session chat1
 //	go run ./cmd/demo -mcp-stdio "npx -y @modelcontextprotocol/server-everything"
 //	go run ./cmd/demo -mcp-http http://localhost:8080/mcp
+//	go run ./cmd/demo -mcp-config mcp.json
 package main
 
 import (
@@ -51,6 +52,7 @@ func main() {
 	segmentedSummary := flag.Bool("segmented-summary", false, "enable tool-driven segmented summarization fallback on overflow")
 
 	var mcpCfg mcpConfig
+	flag.StringVar(&mcpCfg.ConfigFile, "mcp-config", "", "MCP servers JSON file (mcpServers; FastMCP/Cursor style)")
 	flag.Func("mcp-stdio", "MCP stdio server as \"command [args...]\" (repeatable)", func(s string) error {
 		mcpCfg.Stdio = append(mcpCfg.Stdio, s)
 		return nil
@@ -156,6 +158,9 @@ func realMain(cfg demoConfig) error {
 	fmt.Printf("model:    %s\n", pc.model)
 	if sid != "" {
 		fmt.Printf("session:  %s\n", sid)
+	}
+	if mcp != nil {
+		fmt.Printf("mcp:      %d server(s)\n", len(mcp.clients))
 	}
 	if cfg.MaxTurns == 0 {
 		fmt.Printf("max-turns: unlimited\n")
