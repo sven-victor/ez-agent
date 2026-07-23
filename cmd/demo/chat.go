@@ -1,12 +1,14 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
+
+	"github.com/ergochat/readline"
 
 	"github.com/sven-victor/ez-agent/agent"
 	"github.com/sven-victor/ez-agent/event"
@@ -26,24 +28,44 @@ func runInteractive(ctx context.Context, a *agent.Agent, toolNames []string) err
 	}
 	fmt.Println()
 
-	in := bufio.NewReader(os.Stdin)
-	for {
-		select {
-		case <-ctx.Done():
-			fmt.Println()
-			return nil
-		default:
-		}
+	histFile := historyPath()
+	rl, err := readline.NewFromConfig(&readline.Config{
+		Prompt:            "you> ",
+		HistoryFile:       histFile,
+		HistoryLimit:      1000,
+		InterruptPrompt:   "^C",
+		EOFPrompt:         "exit",
+		HistorySearchFold: true,
+	})
+	if err != nil {
+		return fmt.Errorf("init readline: %w", err)
+	}
+	defer rl.Close()
 
-		fmt.Print("you> ")
-		line, err := in.ReadString('\n')
+	// Unblock ReadLine when the process context is cancelled (SIGINT/SIGTERM).
+	go func() {
+		<-ctx.Done()
+		_ = rl.Close()
+	}()
+
+	for {
+		line, err := rl.ReadLine()
 		if err != nil {
-			if err == io.EOF {
+			if err == readline.ErrInterrupt {
+				// Empty line + Ctrl+C → quit; otherwise clear and continue.
+				if strings.TrimSpace(line) == "" {
+					fmt.Println()
+					return nil
+				}
+				continue
+			}
+			if err == io.EOF || ctx.Err() != nil {
 				fmt.Println()
 				return nil
 			}
 			return err
 		}
+
 		line = strings.TrimSpace(line)
 		if line == "" {
 			continue
@@ -78,6 +100,18 @@ func runInteractive(ctx context.Context, a *agent.Agent, toolNames []string) err
 		}
 		fmt.Println()
 	}
+}
+
+func historyPath() string {
+	wd, err := os.Getwd()
+	if err != nil {
+		return ""
+	}
+	dir := filepath.Join(wd, ".sessions")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return ""
+	}
+	return filepath.Join(dir, "demo_history")
 }
 
 func streamTurn(ctx context.Context, a *agent.Agent, prompt string) error {
@@ -133,6 +167,13 @@ func printHelp() {
   /help, /?     show this help
   /tools        list available tools
   /quit, /exit  leave the chat
+
+Line editing:
+  ↑/↓           previous / next history
+  ←/→           move cursor
+  Ctrl+A/E      start / end of line
+  Ctrl+C        clear line (quit if empty)
+  Ctrl+D        exit
 
 Anything else is sent to the assistant.`)
 }

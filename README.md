@@ -125,7 +125,7 @@ Example `mcp.json` (FastMCP / Cursor canonical `mcpServers` format):
 
 Config-file servers prefix tool names with `<server>_` (e.g. `devops_list_pods`).
 
-Built-in tools: `current_time`, `format_time`, `random_string`. Slash commands in the REPL: `/help`, `/tools`, `/quit`.
+Built-in tools: `current_time`, `format_time`, `random_string`. Slash commands in the REPL: `/help`, `/tools`, `/quit`. Interactive input uses readline (↑/↓ history, ←/→ cursor, CJK-aware backspace); history is stored under `.sessions/demo_history`.
 
 Context: by default the demo enables `memory.Summarize` with `RobustSummarizer` (retry / map-reduce / truncate), proactive when the model window exceeds `-summarize-at` messages (optional `-summarize-tokens`), and on provider overflow. Use `-segmented-summary` for tool-driven segmented fallback. Session `Transcript` is unchanged — only the model window is compressed.
 
