@@ -16,6 +16,7 @@ Inspired by [Strands Agents](https://strandsagents.com/) **behavior** (loop, too
 | Structured output | Native JSON Schema via `WithOutputSchema` (OpenAI `response_format`, Anthropic `output_config`, Gemini `responseSchema`) |
 | Streaming | `RunStream` yields typed `event.Event` values |
 | Hooks / Plugins | Before/After Run, Model, Tool; plugins register tools + hooks; `contrib/memoryplugin` |
+| Logging | Optional `WithLogger` (`Debug`/`Info`/`Warn`/`Error`); `logger.FromSlog` for `log/slog` |
 | Limits | `MaxTurns`, `MaxTotalTokens`, `MaxOutputTokens`; cancel via `context` |
 | Memory | `Noop`, `Window`, `Summarize` (+ `RobustSummarizer`, `SegmentedSummarizer`), `Offload`, `DegradeMedia`; `SessionStore`; `LongTerm` |
 | Checkpoint | `WithCheckpoint` mid-run snapshots; `LoadCheckpoint` / `SaveCheckpoint` / `Continue` |
@@ -137,6 +138,7 @@ agent.Agent          # New / Run / RunStream / Resume / Continue / Checkpoint
           ├── model.Provider (+ openai / anthropic / gemini)
           ├── tool.Executor / Registry (Multi / MapRegistry)
           ├── hook.Registry
+          ├── logger.Logger (optional diagnostics)
           └── memory.ContextPolicy
 domain: message · event · run
 cross-cutting: plugin · realtime (not in Turn loop) · contrib/
@@ -167,6 +169,7 @@ a, err := agent.New(
     agent.WithInterrupter(loop.FuncInterrupter(…)),
     agent.WithCheckpoint("run-1", memory.NewMemCheckpointStore()),
     agent.WithPreferComplete(true),        // use Provider.Complete instead of Stream
+    agent.WithLogger(logger.FromSlog(slog.Default())), // optional framework diagnostics
 )
 ```
 
@@ -179,6 +182,26 @@ Accessors:
 | `Hooks()` | `*hook.Registry` |
 | `Tools()` | local `*tool.MapRegistry` (plugins / `WithTools`) |
 | `ToolsRegistry()` | live composed registry (`Tools` + `WithToolRegistry` extras) |
+
+### Logging
+
+Pass an optional `logger.Logger` via `WithLogger` for framework diagnostics (`Debug` / `Info` / `Warn` / `Error`). When omitted, logging is a no-op. Key-value args follow `log/slog` conventions.
+
+```go
+import (
+    "log/slog"
+    "github.com/sven-victor/ez-agent/logger"
+)
+
+a, err := agent.New(
+    agent.WithProvider(p),
+    agent.WithLogger(logger.FromSlog(slog.Default())),
+)
+```
+
+Emissions cover agent construction, run start/finish, model calls, overflow/retries, tool start/finish, session/checkpoint I/O, cancel, fatal errors, and context policies (summarize / window / offload / media degrade). `agent.WithLogger` also fills nil `Logger` fields on known `memory.ContextPolicy` / summarizer trees via `memory.SetLogger`.
+
+Hooks remain for control/mutation; the logger is observability only.
 
 ### Run vs RunStream
 

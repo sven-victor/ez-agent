@@ -2,10 +2,13 @@ package agent_test
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/sven-victor/ez-agent/agent"
 	"github.com/sven-victor/ez-agent/event"
+	"github.com/sven-victor/ez-agent/logger"
+	"github.com/sven-victor/ez-agent/memory"
 	"github.com/sven-victor/ez-agent/message"
 	"github.com/sven-victor/ez-agent/model"
 	"github.com/sven-victor/ez-agent/plugin"
@@ -85,5 +88,57 @@ func TestRunAndStream(t *testing.T) {
 	}
 	if !finished {
 		t.Fatal("expected RunFinished")
+	}
+}
+
+func TestWithLogger(t *testing.T) {
+	var msgs []string
+	log := logger.Func{
+		InfoFunc: func(msg string, _ ...any) {
+			msgs = append(msgs, msg)
+		},
+	}
+	a, err := agent.New(
+		agent.WithProvider(echoProvider{}),
+		agent.WithLogger(log),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := a.Run(context.Background(), run.Input{Text: "hi"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.StopReason != run.StopEndTurn {
+		t.Fatal(res.StopReason)
+	}
+	joined := strings.Join(msgs, "|")
+	for _, want := range []string{"agent created", "run started", "model finished", "run finished"} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("missing %q in logs: %v", want, msgs)
+		}
+	}
+}
+
+func TestWithLoggerInjectsContextPolicy(t *testing.T) {
+	log := logger.Nop()
+	pol := &memory.Summarize{
+		Summarizer:           &memory.ProviderSummarizer{Provider: echoProvider{}},
+		KeepRecent:           2,
+		ProactiveMaxMessages: 100,
+	}
+	_, err := agent.New(
+		agent.WithProvider(echoProvider{}),
+		agent.WithContextPolicy(pol),
+		agent.WithLogger(log),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pol.Logger == nil {
+		t.Fatal("expected SetLogger to fill Summarize.Logger")
+	}
+	if ps, ok := pol.Summarizer.(*memory.ProviderSummarizer); !ok || ps.Logger == nil {
+		t.Fatal("expected SetLogger to fill ProviderSummarizer.Logger")
 	}
 }

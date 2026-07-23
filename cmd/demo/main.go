@@ -26,6 +26,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -34,6 +35,7 @@ import (
 
 	"github.com/sven-victor/ez-agent/agent"
 	"github.com/sven-victor/ez-agent/internal/livetest"
+	"github.com/sven-victor/ez-agent/logger"
 	"github.com/sven-victor/ez-agent/memory"
 	"github.com/sven-victor/ez-agent/model"
 	"github.com/sven-victor/ez-agent/run"
@@ -50,6 +52,7 @@ func main() {
 	summarizeTokens := flag.Int("summarize-tokens", 0, "proactively summarize when estimated tokens exceed N (0=off)")
 	noSummarize := flag.Bool("no-summarize", false, "disable automatic context summarization")
 	segmentedSummary := flag.Bool("segmented-summary", false, "enable tool-driven segmented summarization fallback on overflow")
+	logLevel := flag.String("log-level", "info", "framework log level: debug|info|warn|error|off")
 
 	var mcpCfg mcpConfig
 	flag.StringVar(&mcpCfg.ConfigFile, "mcp-config", "", "MCP servers JSON file (mcpServers; FastMCP/Cursor style)")
@@ -78,6 +81,7 @@ func main() {
 		SummarizeTokens:  *summarizeTokens,
 		NoSummarize:      *noSummarize,
 		SegmentedSummary: *segmentedSummary,
+		LogLevel:         *logLevel,
 		MCP:              mcpCfg,
 	}
 	if err := realMain(cfg); err != nil {
@@ -97,6 +101,7 @@ type demoConfig struct {
 	SummarizeTokens  int
 	NoSummarize      bool
 	SegmentedSummary bool
+	LogLevel         string
 	MCP              mcpConfig
 }
 
@@ -231,6 +236,9 @@ Be concise unless the user asks for detail.`
 		agent.WithTools(builtinTools()...),
 		agent.WithLimits(run.Limits{MaxTurns: cfg.MaxTurns}),
 	}
+	if log := demoLogger(cfg.LogLevel); log != nil {
+		opts = append(opts, agent.WithLogger(log))
+	}
 	if !cfg.NoSummarize {
 		opts = append(opts, agent.WithContextPolicy(newSummarizePolicy(pc.provider, cfg)))
 	}
@@ -289,4 +297,24 @@ func firstNonEmpty(vals ...string) string {
 		}
 	}
 	return ""
+}
+
+func demoLogger(level string) logger.Logger {
+	var lv slog.Level
+	switch strings.ToLower(strings.TrimSpace(level)) {
+	case "", "info":
+		lv = slog.LevelInfo
+	case "debug":
+		lv = slog.LevelDebug
+	case "warn", "warning":
+		lv = slog.LevelWarn
+	case "error":
+		lv = slog.LevelError
+	case "off", "none", "silent":
+		return nil
+	default:
+		lv = slog.LevelInfo
+	}
+	h := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: lv})
+	return logger.FromSlog(slog.New(h))
 }

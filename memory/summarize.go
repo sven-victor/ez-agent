@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/sven-victor/ez-agent/logger"
 	"github.com/sven-victor/ez-agent/message"
 	"github.com/sven-victor/ez-agent/run"
 )
@@ -43,6 +44,9 @@ type Summarize struct {
 	// Fallback runs when summarization fails or does not shrink the window.
 	// nil → drop oldest tool-aware message group once.
 	Fallback ContextPolicy
+	// Logger receives summarization diagnostics; nil is a no-op.
+	// agent.WithLogger also fills this via SetLogger when unset.
+	Logger logger.Logger
 }
 
 func (s *Summarize) ratio() float64 {
@@ -77,11 +81,26 @@ func (s *Summarize) needsProactive(st *run.State) bool {
 }
 
 func (s *Summarize) Prepare(ctx context.Context, st *run.State) error {
+	log := policyLog(s.Logger)
 	if s.MaxMessageBytes > 0 {
+		before := len(st.Messages)
 		st.Messages = CondenseOversizedParts(st.Messages, s.MaxMessageBytes)
+		log.Debug("condensed oversized parts before prepare", "messages", before, "max_bytes", s.MaxMessageBytes)
 	}
 	if s.needsProactive(st) {
-		_ = s.summarizeOldest(ctx, st, false) // best-effort; no segmented
+		before := len(st.Messages)
+		est := EstimateTokens(st.Messages)
+		log.Info("proactive summarize",
+			"messages", before,
+			"est_tokens", est,
+			"max_messages", s.ProactiveMaxMessages,
+			"max_tokens", s.ProactiveMaxTokens,
+		)
+		if err := s.summarizeOldest(ctx, st, false); err != nil {
+			log.Warn("proactive summarize failed (ignored)", "err", err, "messages", before)
+		} else {
+			log.Info("proactive summarize done", "before", before, "after", len(st.Messages))
+		}
 	}
 	if s.Inner != nil {
 		return s.Inner.Prepare(ctx, st)
@@ -90,42 +109,61 @@ func (s *Summarize) Prepare(ctx context.Context, st *run.State) error {
 }
 
 func (s *Summarize) Reduce(ctx context.Context, st *run.State) error {
+	log := policyLog(s.Logger)
 	before := len(st.Messages)
+	log.Info("reactive summarize (overflow reduce)", "messages", before)
 	if s.MaxMessageBytes > 0 {
 		st.Messages = CondenseOversizedParts(st.Messages, s.MaxMessageBytes)
 	}
 
 	sumErr := s.summarizeOldest(ctx, st, true)
+	if sumErr != nil {
+		log.Warn("summarize reduce primary failed", "err", sumErr, "messages", len(st.Messages))
+	} else if len(st.Messages) < before {
+		log.Info("summarize reduce done", "before", before, "after", len(st.Messages))
+	}
 	if sumErr != nil || len(st.Messages) >= before {
+		fbBefore := len(st.Messages)
 		if ferr := s.applyFallback(ctx, st); ferr != nil && len(st.Messages) >= before {
+			log.Error("summarize reduce fallback failed", "err", ferr, "sum_err", sumErr)
 			if sumErr != nil {
 				return fmt.Errorf("summarize reduce: %w (fallback: %v)", sumErr, ferr)
 			}
 			return ferr
+		}
+		if len(st.Messages) < fbBefore {
+			log.Info("summarize reduce fallback applied", "before", fbBefore, "after", len(st.Messages))
 		}
 	}
 
 	if s.Inner != nil {
 		if err := s.Inner.Reduce(ctx, st); err != nil {
 			if len(st.Messages) >= before {
+				log.Error("summarize inner reduce failed", "err", err)
 				return err
 			}
+			log.Warn("summarize inner reduce error after shrink (ignored)", "err", err)
 		}
 	}
 	if len(st.Messages) >= before {
-		return fmt.Errorf("summarize reduce: failed to reduce context")
+		err := fmt.Errorf("summarize reduce: failed to reduce context")
+		log.Error("summarize reduce failed", "err", err, "messages", before)
+		return err
 	}
 	return nil
 }
 
 func (s *Summarize) applyFallback(ctx context.Context, st *run.State) error {
+	log := policyLog(s.Logger)
 	if s.Fallback != nil {
+		log.Debug("applying summarize fallback policy")
 		return s.Fallback.Reduce(ctx, st)
 	}
 	before := len(st.Messages)
 	if before == 0 {
 		return fmt.Errorf("summarize fallback: no messages")
 	}
+	log.Debug("dropping oldest message group as fallback", "messages", before)
 	st.Messages = dropOldestGroup(st.Messages)
 	if len(st.Messages) >= before {
 		return fmt.Errorf("summarize fallback: failed to drop messages")
@@ -134,6 +172,7 @@ func (s *Summarize) applyFallback(ctx context.Context, st *run.State) error {
 }
 
 func (s *Summarize) summarizeOldest(ctx context.Context, st *run.State, allowSegmented bool) error {
+	log := policyLog(s.Logger)
 	if s.Summarizer == nil {
 		return fmt.Errorf("summarize: Summarizer is required")
 	}
@@ -156,8 +195,16 @@ func (s *Summarize) summarizeOldest(ctx context.Context, st *run.State, allowSeg
 	remaining := st.Messages[count:]
 	input := s.withIntent(st.Messages, toSummarize)
 
+	log.Info("summarizing oldest messages",
+		"total", n,
+		"summarize", count,
+		"keep", len(remaining),
+		"allow_segmented", allowSegmented,
+	)
+
 	summary, err := s.Summarizer.Summarize(ctx, input)
 	if err != nil && allowSegmented && s.Segmented != nil {
+		log.Warn("primary summarizer failed; trying segmented", "err", err)
 		summary, err = s.Segmented.Summarize(ctx, input)
 	}
 	if err != nil {
@@ -168,6 +215,7 @@ func (s *Summarize) summarizeOldest(ctx context.Context, st *run.State, allowSeg
 	}
 	message.EnsureID(&summary)
 	st.Messages = append([]message.Message{summary}, remaining...)
+	log.Debug("summary message applied", "remaining", len(remaining), "summary_id", summary.ID)
 	return nil
 }
 

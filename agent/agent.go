@@ -8,6 +8,7 @@ import (
 
 	"github.com/sven-victor/ez-agent/event"
 	"github.com/sven-victor/ez-agent/hook"
+	"github.com/sven-victor/ez-agent/logger"
 	"github.com/sven-victor/ez-agent/loop"
 	"github.com/sven-victor/ez-agent/memory"
 	"github.com/sven-victor/ez-agent/message"
@@ -39,6 +40,7 @@ type Agent struct {
 	checkpointID    string
 	checkpointStore memory.CheckpointStore
 	preferComplete  bool
+	logger          logger.Logger
 }
 
 // Option configures Agent construction.
@@ -64,6 +66,7 @@ type config struct {
 	checkpointID    string
 	checkpointStore memory.CheckpointStore
 	preferComplete  bool
+	logger          logger.Logger
 }
 
 // WithProvider sets the model provider (required).
@@ -216,6 +219,17 @@ func WithPreferComplete(v bool) Option {
 	}
 }
 
+// WithLogger sets an optional Logger for framework diagnostics at key agent/loop nodes.
+// When omitted, logging is a no-op. Use logger.FromSlog to adapt log/slog.
+// New also calls memory.SetLogger so nil Logger fields on the configured
+// ContextPolicy / summarizers inherit this logger.
+func WithLogger(l logger.Logger) Option {
+	return func(c *config) error {
+		c.logger = l
+		return nil
+	}
+}
+
 // New constructs an Agent. Plugin install failures abort with no half-installed agent.
 func New(opts ...Option) (*Agent, error) {
 	cfg := &config{
@@ -262,7 +276,15 @@ func New(opts ...Option) (*Agent, error) {
 		checkpointID:    cfg.checkpointID,
 		checkpointStore: cfg.checkpointStore,
 		preferComplete:  cfg.preferComplete,
+		logger:          logger.OrNop(cfg.logger),
 	}
+	a.logger.Info("agent created",
+		"provider", a.provider.Name(),
+		"tools", len(a.tools.Specs()),
+		"session", a.sessionID != "",
+		"checkpoint", a.checkpointID != "",
+	)
+	memory.SetLogger(a.policy, a.logger)
 	a.rebuildLoop()
 	return a, nil
 }
@@ -297,6 +319,7 @@ func (a *Agent) rebuildLoop() {
 		SessionStore:    a.sessionStore,
 		SessionID:       a.sessionID,
 		PreferComplete:  a.preferComplete,
+		Logger:          a.logger,
 	})
 }
 
@@ -329,6 +352,7 @@ func (a *Agent) Resume(ctx context.Context, st *run.State) (*run.Result, error) 
 	if st == nil || st.Pending == nil || len(st.Pending.Calls) == 0 {
 		return nil, fmt.Errorf("agent: nothing to resume")
 	}
+	a.logger.Info("resume run", "pending_tools", len(st.Pending.Calls), "turn", st.Turn)
 	res, err := a.loop.Run(ctx, st, nil)
 	if saveErr := a.saveSession(ctx, st); saveErr != nil && err == nil {
 		return res, saveErr
@@ -345,6 +369,7 @@ func (a *Agent) Continue(ctx context.Context, st *run.State) (*run.Result, error
 	if st.Values == nil {
 		st.Values = map[string]any{}
 	}
+	a.logger.Info("continue run", "turn", st.Turn, "messages", len(st.Messages))
 	res, err := a.loop.Run(ctx, st, nil)
 	if saveErr := a.saveSession(ctx, st); saveErr != nil && err == nil {
 		return res, saveErr
@@ -357,7 +382,17 @@ func (a *Agent) LoadCheckpoint(ctx context.Context) (*run.State, error) {
 	if a.checkpointStore == nil || a.checkpointID == "" {
 		return nil, fmt.Errorf("agent: checkpoint not configured")
 	}
-	return a.checkpointStore.Load(ctx, a.checkpointID)
+	st, err := a.checkpointStore.Load(ctx, a.checkpointID)
+	if err != nil {
+		a.logger.Error("checkpoint load failed", "checkpoint_id", a.checkpointID, "err", err)
+		return nil, err
+	}
+	msgs := 0
+	if st != nil {
+		msgs = len(st.Messages)
+	}
+	a.logger.Debug("checkpoint loaded", "checkpoint_id", a.checkpointID, "messages", msgs)
+	return st, nil
 }
 
 // SaveCheckpoint persists st under the configured checkpoint id.
@@ -365,7 +400,12 @@ func (a *Agent) SaveCheckpoint(ctx context.Context, st *run.State) error {
 	if a.checkpointStore == nil || a.checkpointID == "" {
 		return fmt.Errorf("agent: checkpoint not configured")
 	}
-	return a.checkpointStore.Save(ctx, a.checkpointID, st)
+	if err := a.checkpointStore.Save(ctx, a.checkpointID, st); err != nil {
+		a.logger.Error("checkpoint save failed", "checkpoint_id", a.checkpointID, "err", err)
+		return err
+	}
+	a.logger.Debug("checkpoint saved", "checkpoint_id", a.checkpointID)
+	return nil
 }
 
 // RunStream runs the loop and pushes typed events. The channel is closed when the run ends.
@@ -428,13 +468,17 @@ func (a *Agent) beginState(ctx context.Context, in run.Input) (*run.State, error
 		sess, err := a.sessionStore.Load(ctx, a.sessionID)
 		if err != nil {
 			if !os.IsNotExist(err) && !isSessionNotFound(err) {
+				a.logger.Error("session load failed", "session_id", a.sessionID, "err", err)
 				return nil, err
 			}
+			a.logger.Debug("session not found, starting fresh", "session_id", a.sessionID)
 		} else {
+			a.logger.Debug("session loaded", "session_id", a.sessionID, "messages", len(sess.Messages))
 			msgs := sess.Messages
 			if message.EnsureIDs(msgs) {
 				// Backfill IDs for sessions persisted before Message.ID existed.
 				if err := a.sessionStore.ReplaceAll(ctx, a.sessionID, msgs); err != nil {
+					a.logger.Error("session id backfill failed", "session_id", a.sessionID, "err", err)
 					return nil, err
 				}
 			}
@@ -447,6 +491,7 @@ func (a *Agent) beginState(ctx context.Context, in run.Input) (*run.State, error
 			}
 			if len(incoming) > 0 {
 				if err := a.sessionStore.Append(ctx, a.sessionID, incoming...); err != nil {
+					a.logger.Error("session append failed", "session_id", a.sessionID, "err", err)
 					return nil, err
 				}
 			}
@@ -456,9 +501,11 @@ func (a *Agent) beginState(ctx context.Context, in run.Input) (*run.State, error
 	st.InitHistory(incoming)
 	if a.sessionStore != nil && a.sessionID != "" && len(incoming) > 0 {
 		if err := a.sessionStore.Append(ctx, a.sessionID, incoming...); err != nil {
+			a.logger.Error("session append failed", "session_id", a.sessionID, "err", err)
 			return nil, err
 		}
 	}
+	a.logger.Debug("run state ready", "messages", len(st.Messages), "incoming", len(incoming))
 	return st, nil
 }
 
@@ -472,9 +519,15 @@ func (a *Agent) saveSession(ctx context.Context, st *run.State) error {
 	}
 	message.EnsureIDs(st.Messages)
 	// Persist the effective model window (post-summarize / trim), not the full transcript.
-	return a.sessionStore.Save(ctx, &memory.Session{
+	err := a.sessionStore.Save(ctx, &memory.Session{
 		ID:       a.sessionID,
 		Messages: append([]message.Message(nil), st.Messages...),
 		Values:   st.Values,
 	})
+	if err != nil {
+		a.logger.Error("session save failed", "session_id", a.sessionID, "err", err)
+		return err
+	}
+	a.logger.Debug("session saved", "session_id", a.sessionID, "messages", len(st.Messages))
+	return nil
 }

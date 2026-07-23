@@ -8,6 +8,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/sven-victor/ez-agent/logger"
 	"github.com/sven-victor/ez-agent/message"
 	"github.com/sven-victor/ez-agent/run"
 )
@@ -83,6 +84,8 @@ type Offload struct {
 	Inner    ContextPolicy
 	Store    BlobStore
 	MaxBytes int // default 32KiB
+	// Logger receives offload diagnostics; nil is a no-op.
+	Logger logger.Logger
 }
 
 func (o *Offload) maxBytes() int {
@@ -189,8 +192,10 @@ func (o *Offload) maybeOffload(ctx context.Context, b message.Blob, max int) (me
 	}
 	ref, err := o.Store.Put(ctx, b)
 	if err != nil {
+		policyLog(o.Logger).Error("blob offload failed", "bytes", len(b.Bytes), "err", err)
 		return message.Blob{}, err
 	}
+	policyLog(o.Logger).Info("blob offloaded", "bytes", len(b.Bytes), "ref", ref, "filename", b.Filename)
 	return message.Blob{
 		MIME:     b.MIME,
 		URL:      ref,

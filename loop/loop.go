@@ -11,6 +11,7 @@ import (
 
 	"github.com/sven-victor/ez-agent/event"
 	"github.com/sven-victor/ez-agent/hook"
+	"github.com/sven-victor/ez-agent/logger"
 	"github.com/sven-victor/ez-agent/memory"
 	"github.com/sven-victor/ez-agent/message"
 	"github.com/sven-victor/ez-agent/model"
@@ -47,6 +48,8 @@ type Config struct {
 	SessionID    string
 	// PreferComplete uses Provider.Complete instead of Stream for model calls.
 	PreferComplete bool
+	// Logger receives framework diagnostics; nil becomes a no-op.
+	Logger logger.Logger
 }
 
 // Loop is the turn state machine.
@@ -68,6 +71,7 @@ func New(cfg Config) *Loop {
 	if cfg.MaxModelRetry <= 0 {
 		cfg.MaxModelRetry = defaultMaxAfterModelRetry
 	}
+	cfg.Logger = logger.OrNop(cfg.Logger)
 	return &Loop{cfg: cfg}
 }
 
@@ -88,10 +92,13 @@ func (l *Loop) Run(ctx context.Context, st *run.State, emit EmitFunc) (res *run.
 	if emit == nil {
 		emit = func(event.Event) error { return nil }
 	}
+	log := l.cfg.Logger
 
+	log.Info("run started", "turn", st.Turn, "messages", len(st.Messages), "pending", st.Pending != nil)
 	_ = emit(event.RunStarted{})
 
 	if err := l.cfg.Hooks.FireBeforeRun(ctx, &hook.BeforeRun{State: st}); err != nil {
+		log.Error("before-run hook failed", "err", err)
 		_ = emit(event.RunError{Err: err})
 		return nil, err
 	}
@@ -100,7 +107,16 @@ func (l *Loop) Run(ctx context.Context, st *run.State, emit EmitFunc) (res *run.
 		after := &hook.AfterRun{State: st, Result: res}
 		_ = l.cfg.Hooks.FireAfterRun(context.WithoutCancel(ctx), after)
 		if res != nil {
+			log.Info("run finished",
+				"stop_reason", res.StopReason,
+				"turns", st.Turn,
+				"input_tokens", res.Usage.InputTokens,
+				"output_tokens", res.Usage.OutputTokens,
+				"total_tokens", res.Usage.TotalTokens,
+			)
 			l.saveCheckpoint(context.WithoutCancel(ctx), st)
+		} else if err != nil {
+			log.Error("run failed", "err", err, "turn", st.Turn)
 		}
 	}()
 
@@ -111,6 +127,7 @@ func (l *Loop) Run(ctx context.Context, st *run.State, emit EmitFunc) (res *run.
 	for {
 		// HITL resume: run pending tools first, then continue to the model.
 		if st.Pending != nil && len(st.Pending.Calls) > 0 {
+			log.Info("resuming pending tools", "count", len(st.Pending.Calls), "turn", st.Turn)
 			if err := l.executePending(ctx, st, emit); err != nil {
 				_ = emit(event.RunError{Err: err})
 				return nil, err
@@ -121,12 +138,14 @@ func (l *Loop) Run(ctx context.Context, st *run.State, emit EmitFunc) (res *run.
 		}
 
 		if reason := checkLimits(st, l.cfg.Limits); reason != "" {
+			log.Info("run stopped by limit", "reason", reason, "turn", st.Turn)
 			res = stop(st, reason)
 			_ = emit(event.RunFinished{Result: res})
 			return res, nil
 		}
 		select {
 		case <-ctx.Done():
+			log.Info("run canceled", "turn", st.Turn, "err", ctx.Err())
 			res = l.finishCanceled(ctx, st)
 			_ = emit(event.Cancelled{})
 			_ = emit(event.RunFinished{Result: res})
@@ -136,14 +155,20 @@ func (l *Loop) Run(ctx context.Context, st *run.State, emit EmitFunc) (res *run.
 
 		beforePrepare := append([]message.Message(nil), st.Messages...)
 		if err := l.cfg.Policy.Prepare(ctx, st); err != nil {
+			log.Error("context prepare failed", "err", err)
 			_ = emit(event.RunError{Err: err})
 			return nil, err
 		}
+		if !sameMessages(beforePrepare, st.Messages) {
+			log.Debug("context prepared", "before", len(beforePrepare), "after", len(st.Messages))
+		}
 		if err := l.syncSessionWindow(ctx, beforePrepare, st.Messages); err != nil {
+			log.Error("session sync failed", "err", err)
 			_ = emit(event.RunError{Err: err})
 			return nil, err
 		}
 		if err := l.cfg.Hooks.FireBeforeModel(ctx, &hook.BeforeModel{State: st}); err != nil {
+			log.Error("before-model hook failed", "err", err)
 			_ = emit(event.RunError{Err: err})
 			return nil, err
 		}
@@ -160,9 +185,22 @@ func (l *Loop) Run(ctx context.Context, st *run.State, emit EmitFunc) (res *run.
 			req.Tools = l.cfg.Tools.Specs()
 		}
 		if err := model.Validate(l.cfg.Provider, req); err != nil {
+			log.Error("model request invalid", "err", err)
 			_ = emit(event.RunError{Err: err})
 			return nil, err
 		}
+
+		providerName := ""
+		if l.cfg.Provider != nil {
+			providerName = l.cfg.Provider.Name()
+		}
+		log.Debug("model call",
+			"provider", providerName,
+			"turn", st.Turn,
+			"messages", len(req.Messages),
+			"tools", len(req.Tools),
+			"complete", l.cfg.PreferComplete,
+		)
 
 		var mres model.Result
 		var err error
@@ -181,16 +219,21 @@ func (l *Loop) Run(ctx context.Context, st *run.State, emit EmitFunc) (res *run.
 		if err != nil {
 			if errors.Is(err, model.ErrOverflow) {
 				overflowRetries++
+				log.Warn("context overflow", "attempt", overflowRetries, "max", l.cfg.MaxOverflow, "err", err)
 				if overflowRetries > l.cfg.MaxOverflow {
+					log.Error("overflow retries exceeded", "attempts", overflowRetries, "err", err)
 					_ = emit(event.RunError{Err: fmt.Errorf("overflow retries exceeded: %w", err)})
 					return nil, err
 				}
 				beforeReduce := append([]message.Message(nil), st.Messages...)
 				if rerr := l.cfg.Policy.Reduce(ctx, st); rerr != nil {
+					log.Error("context reduce failed", "err", rerr)
 					_ = emit(event.RunError{Err: rerr})
 					return nil, rerr
 				}
+				log.Info("context reduced after overflow", "before", len(beforeReduce), "after", len(st.Messages))
 				if serr := l.syncSessionWindow(ctx, beforeReduce, st.Messages); serr != nil {
+					log.Error("session sync failed", "err", serr)
 					_ = emit(event.RunError{Err: serr})
 					return nil, serr
 				}
@@ -199,8 +242,10 @@ func (l *Loop) Run(ctx context.Context, st *run.State, emit EmitFunc) (res *run.
 			if l.cfg.RetryPolicy != nil {
 				providerRetries++
 				if wait, ok := l.cfg.RetryPolicy.ShouldRetry(providerRetries, err); ok {
+					log.Warn("provider retry scheduled", "attempt", providerRetries, "wait", wait, "err", err)
 					select {
 					case <-ctx.Done():
+						log.Info("run canceled during provider retry", "err", ctx.Err())
 						res = l.finishCanceled(ctx, st)
 						_ = emit(event.Cancelled{})
 						_ = emit(event.RunFinished{Result: res})
@@ -212,31 +257,43 @@ func (l *Loop) Run(ctx context.Context, st *run.State, emit EmitFunc) (res *run.
 			}
 			select {
 			case <-ctx.Done():
+				log.Info("run canceled", "turn", st.Turn, "err", ctx.Err())
 				res = l.finishCanceled(ctx, st)
 				_ = emit(event.Cancelled{})
 				_ = emit(event.RunFinished{Result: res})
 				return res, ctx.Err()
 			default:
 			}
+			log.Error("model call failed", "provider", providerName, "err", err)
 			_ = emit(event.RunError{Err: err})
 			return nil, err
 		}
 		overflowRetries = 0
 		providerRetries = 0
 
-		msg := sanitizeIncompleteToolUse(mres)
+		log.Info("model finished",
+			"turn", st.Turn,
+			"stop_reason", mres.StopReason,
+			"input_tokens", mres.Usage.InputTokens,
+			"output_tokens", mres.Usage.OutputTokens,
+		)
+
+		msg := sanitizeIncompleteToolUse(mres, log)
 		if len(l.cfg.OutputSchema) > 0 && msg.StopReason != run.StopToolUse {
 			structured, verr := validateStructuredJSON(msg.Message)
 			if verr != nil {
 				modelRetries++
+				log.Warn("structured output invalid", "attempt", modelRetries, "max", l.cfg.MaxModelRetry, "err", verr)
 				if modelRetries > l.cfg.MaxModelRetry {
 					err := fmt.Errorf("structured output invalid: %w", verr)
+					log.Error("structured output retries exceeded", "err", err)
 					_ = emit(event.RunError{Err: err})
 					return nil, err
 				}
 				continue
 			}
 			if err := l.appendMessage(ctx, st, msg.Message); err != nil {
+				log.Error("append message failed", "err", err)
 				_ = emit(event.RunError{Err: err})
 				return nil, err
 			}
@@ -248,6 +305,7 @@ func (l *Loop) Run(ctx context.Context, st *run.State, emit EmitFunc) (res *run.
 		}
 
 		if err := l.appendMessage(ctx, st, msg.Message); err != nil {
+			log.Error("append message failed", "err", err)
 			_ = emit(event.RunError{Err: err})
 			return nil, err
 		}
@@ -255,6 +313,7 @@ func (l *Loop) Run(ctx context.Context, st *run.State, emit EmitFunc) (res *run.
 
 		after := &hook.AfterModel{State: st, Result: msg}
 		if err := l.cfg.Hooks.FireAfterModel(ctx, after); err != nil {
+			log.Error("after-model hook failed", "err", err)
 			_ = emit(event.RunError{Err: err})
 			return nil, err
 		}
@@ -266,15 +325,19 @@ func (l *Loop) Run(ctx context.Context, st *run.State, emit EmitFunc) (res *run.
 			message.EnsureID(&rm)
 			st.ReplaceLastMessage(rm)
 			msg.Message = rm
+			log.Debug("after-model replaced message")
 			if err := l.sessionReplaceAll(ctx, st.Messages); err != nil {
+				log.Error("session replace failed", "err", err)
 				_ = emit(event.RunError{Err: err})
 				return nil, err
 			}
 		}
 		if after.Retry {
 			modelRetries++
+			log.Warn("after-model retry", "attempt", modelRetries, "max", l.cfg.MaxModelRetry)
 			if modelRetries > l.cfg.MaxModelRetry {
 				err := fmt.Errorf("after-model retry limit exceeded")
+				log.Error("after-model retries exceeded", "err", err)
 				_ = emit(event.RunError{Err: err})
 				return nil, err
 			}
@@ -282,6 +345,7 @@ func (l *Loop) Run(ctx context.Context, st *run.State, emit EmitFunc) (res *run.
 				if wait, ok := l.cfg.RetryPolicy.ShouldRetry(modelRetries, fmt.Errorf("after-model retry")); ok {
 					select {
 					case <-ctx.Done():
+						log.Info("run canceled during after-model retry", "err", ctx.Err())
 						res = l.finishCanceled(ctx, st)
 						_ = emit(event.Cancelled{})
 						_ = emit(event.RunFinished{Result: res})
@@ -292,6 +356,7 @@ func (l *Loop) Run(ctx context.Context, st *run.State, emit EmitFunc) (res *run.
 			}
 			st.PopLastMessage()
 			if err := l.sessionReplaceAll(ctx, st.Messages); err != nil {
+				log.Error("session replace failed", "err", err)
 				_ = emit(event.RunError{Err: err})
 				return nil, err
 			}
@@ -307,6 +372,7 @@ func (l *Loop) Run(ctx context.Context, st *run.State, emit EmitFunc) (res *run.
 
 		calls := toolCalls(msg.Message)
 		if len(calls) == 0 {
+			log.Debug("tool_use stop with no calls; ending turn")
 			res = stop(st, run.StopEndTurn)
 			_ = emit(event.RunFinished{Result: res})
 			return res, nil
@@ -315,12 +381,14 @@ func (l *Loop) Run(ctx context.Context, st *run.State, emit EmitFunc) (res *run.
 		if l.cfg.Interrupter != nil {
 			interrupt, ierr := l.cfg.Interrupter.BeforeTools(ctx, st, calls)
 			if ierr != nil {
+				log.Error("interrupter failed", "err", ierr)
 				_ = emit(event.RunError{Err: ierr})
 				return nil, ierr
 			}
 			if interrupt {
 				pending := pendingFromCalls(calls)
 				st.Pending = pending
+				log.Info("run interrupted before tools", "tools", len(calls), "turn", st.Turn)
 				res = stop(st, run.StopInterrupted)
 				res.Pending = pending
 				_ = emit(event.Interrupted{Pending: pending})
@@ -341,7 +409,11 @@ func (l *Loop) saveCheckpoint(ctx context.Context, st *run.State) {
 	if l.cfg.CheckpointStore == nil || l.cfg.CheckpointID == "" || st == nil {
 		return
 	}
-	_ = l.cfg.CheckpointStore.Save(ctx, l.cfg.CheckpointID, st)
+	if err := l.cfg.CheckpointStore.Save(ctx, l.cfg.CheckpointID, st); err != nil {
+		l.cfg.Logger.Warn("checkpoint save failed", "checkpoint_id", l.cfg.CheckpointID, "err", err)
+		return
+	}
+	l.cfg.Logger.Debug("checkpoint saved", "checkpoint_id", l.cfg.CheckpointID, "turn", st.Turn)
 }
 
 func (l *Loop) appendMessage(ctx context.Context, st *run.State, m message.Message) error {
@@ -385,28 +457,37 @@ func (l *Loop) executePending(ctx context.Context, st *run.State, emit EmitFunc)
 }
 
 func (l *Loop) runTools(ctx context.Context, st *run.State, emit EmitFunc, calls []tool.Call) error {
+	log := l.cfg.Logger
 	exec := l.executor(st)
 	for _, call := range calls {
+		log.Info("tool started", "tool", call.Name, "tool_use_id", call.ID, "turn", st.Turn)
 		_ = emit(event.ToolStarted{Call: call})
 	}
+	start := time.Now()
 	results, err := exec.Execute(ctx, calls)
+	elapsed := time.Since(start)
 	if err != nil {
+		log.Error("tool execution failed", "count", len(calls), "duration", elapsed, "err", err)
 		if len(results) == len(calls) {
 			for i, call := range calls {
+				log.Info("tool finished", "tool", call.Name, "tool_use_id", call.ID, "ok", results[i].OK)
 				_ = emit(event.ToolFinished{Call: call, Result: results[i]})
 			}
 			if aerr := l.appendMessage(ctx, st, message.NewToolResultMessage(tool.ToMessageParts(results)...)); aerr != nil {
+				log.Error("append tool results failed", "err", aerr)
 				_ = emit(event.RunError{Err: aerr})
 				return aerr
 			}
 		} else {
 			if aerr := l.appendMessage(ctx, st, syntheticErrorResults(calls, err)); aerr != nil {
+				log.Error("append synthetic tool errors failed", "err", aerr)
 				_ = emit(event.RunError{Err: aerr})
 				return aerr
 			}
 		}
 		select {
 		case <-ctx.Done():
+			log.Info("run canceled during tools", "err", ctx.Err())
 			_ = emit(event.Cancelled{})
 			_ = emit(event.RunFinished{Result: stop(st, run.StopCanceled)})
 			return ctx.Err()
@@ -416,6 +497,12 @@ func (l *Loop) runTools(ctx context.Context, st *run.State, emit EmitFunc, calls
 		return err
 	}
 	for i, call := range calls {
+		log.Info("tool finished",
+			"tool", call.Name,
+			"tool_use_id", call.ID,
+			"ok", results[i].OK,
+			"duration", elapsed,
+		)
 		_ = emit(event.ToolFinished{Call: call, Result: results[i]})
 	}
 	return l.appendMessage(ctx, st, message.NewToolResultMessage(tool.ToMessageParts(results)...))
@@ -448,11 +535,13 @@ func (l *Loop) executor(st *run.State) tool.Executor {
 	return &tool.Concurrent{Registry: reg, Hooks: hooks}
 }
 
-func sanitizeIncompleteToolUse(mres model.Result) model.Result {
+func sanitizeIncompleteToolUse(mres model.Result, log logger.Logger) model.Result {
+	log = logger.OrNop(log)
 	// max_tokens: never execute tool calls (args may look valid yet be truncated mid-stream).
 	forceStripAll := mres.StopReason == run.StopMaxTokens
 	var parts []message.Part
 	stripped := false
+	strippedCount := 0
 	for _, p := range mres.Message.Parts {
 		tu, ok := p.(message.ToolUse)
 		if !ok {
@@ -461,6 +550,7 @@ func sanitizeIncompleteToolUse(mres model.Result) model.Result {
 		}
 		if forceStripAll || !completeToolUse(tu) {
 			stripped = true
+			strippedCount++
 			continue
 		}
 		parts = append(parts, tu)
@@ -468,6 +558,11 @@ func sanitizeIncompleteToolUse(mres model.Result) model.Result {
 	if !stripped {
 		return mres
 	}
+	log.Warn("incomplete tool calls omitted",
+		"count", strippedCount,
+		"force_max_tokens", forceStripAll,
+		"stop_reason", mres.StopReason,
+	)
 	note := "[incomplete tool call omitted]"
 	if forceStripAll {
 		note = "[incomplete tool call omitted due to max_tokens]"

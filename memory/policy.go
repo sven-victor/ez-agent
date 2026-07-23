@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/sven-victor/ez-agent/logger"
 	"github.com/sven-victor/ez-agent/message"
 	"github.com/sven-victor/ez-agent/run"
 )
@@ -26,15 +27,18 @@ func (Noop) Reduce(context.Context, *run.State) error {
 // Window keeps the most recent MaxMessages messages, deleting tool pairs as whole groups.
 type Window struct {
 	MaxMessages int
+	// Logger receives trim diagnostics; nil is a no-op.
+	Logger logger.Logger
 }
 
 func (w *Window) Prepare(_ context.Context, st *run.State) error {
-	return w.trim(st)
+	return w.trim(st, "prepare")
 }
 
 func (w *Window) Reduce(_ context.Context, st *run.State) error {
+	log := policyLog(w.Logger)
 	before := len(st.Messages)
-	if err := w.trim(st); err != nil {
+	if err := w.trim(st, "reduce"); err != nil {
 		return err
 	}
 	if len(st.Messages) >= before {
@@ -46,19 +50,23 @@ func (w *Window) Reduce(_ context.Context, st *run.State) error {
 		if len(st.Messages) >= before {
 			return fmt.Errorf("window reduce: failed to reduce context")
 		}
+		log.Info("window force-dropped oldest group", "before", before, "after", len(st.Messages))
 	}
 	return nil
 }
 
-func (w *Window) trim(st *run.State) error {
+func (w *Window) trim(st *run.State, phase string) error {
 	if w == nil || w.MaxMessages <= 0 || len(st.Messages) <= w.MaxMessages {
 		return nil
 	}
+	log := policyLog(w.Logger)
+	before := len(st.Messages)
 	msgs := st.Messages
 	for len(msgs) > w.MaxMessages {
 		msgs = dropOldestGroup(msgs)
 	}
 	st.Messages = msgs
+	log.Debug("window trimmed", "phase", phase, "before", before, "after", len(st.Messages), "max", w.MaxMessages)
 	return nil
 }
 
