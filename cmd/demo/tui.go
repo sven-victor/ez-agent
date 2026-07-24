@@ -66,7 +66,7 @@ func newTUIKeyMap() tuiKeyMap {
 func (k tuiKeyMap) helpLines() []string {
 	return []string{
 		"enter send · ↑/↓ input history · esc cancel · tab focus · ctrl+t tools · ctrl+l logs · ? help · ctrl+c quit",
-		"focus chat/tools/logs: ↑/↓ scroll · pgup/pgdn page",
+		"focus chat/tools/logs: ↑/↓ scroll · pgup/pgdn page · drag to select/copy (mouse capture off)",
 	}
 }
 
@@ -130,7 +130,7 @@ func runTUI(ctx context.Context, a *agent.Agent, toolNames []string, meta sessio
 	statusCh := make(chan statusSnapMsg, 64)
 	attachStatusHooks(a, statusCh)
 	m := newTUIModel(ctx, a, toolNames, meta, logCh, statusCh, sessionMsgs)
-	p := tea.NewProgram(m, tea.WithAltScreen(), tea.WithMouseCellMotion(), tea.WithContext(ctx))
+	p := tea.NewProgram(m, tea.WithAltScreen(), tea.WithContext(ctx))
 	_, err := p.Run()
 	return err
 }
@@ -175,6 +175,8 @@ func newTUIModel(ctx context.Context, a *agent.Agent, toolNames []string, meta s
 	m.chatVP.MouseWheelEnabled = true
 	m.toolsVP.MouseWheelEnabled = true
 	m.logsVP.MouseWheelEnabled = true
+	// Note: mouse tracking is intentionally off so the terminal keeps native
+	// drag-select / copy. Pane scroll uses Tab + ↑/↓ / PgUp/PgDn.
 
 	var intro []string
 	intro = append(intro, fmt.Sprintf("ez-agent demo · %s / %s", meta.Provider, meta.Model))
