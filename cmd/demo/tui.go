@@ -16,6 +16,8 @@ import (
 
 	"github.com/sven-victor/ez-agent/agent"
 	"github.com/sven-victor/ez-agent/event"
+	"github.com/sven-victor/ez-agent/memory"
+	"github.com/sven-victor/ez-agent/message"
 	"github.com/sven-victor/ez-agent/run"
 )
 
@@ -63,7 +65,7 @@ func newTUIKeyMap() tuiKeyMap {
 
 func (k tuiKeyMap) helpLines() []string {
 	return []string{
-		"enter send · esc cancel · tab focus · ctrl+t tools · ctrl+l logs · ? help · ctrl+c quit",
+		"enter send · ↑/↓ input history · esc cancel · tab focus · ctrl+t tools · ctrl+l logs · ? help · ctrl+c quit",
 		"focus chat/tools/logs: ↑/↓ scroll · pgup/pgdn page",
 	}
 }
@@ -103,6 +105,11 @@ type tuiModel struct {
 	mdRender *glamour.TermRenderer
 	mdWidth  int
 
+	histPath  string
+	hist      []string
+	histIdx   int    // len(hist) = editing current draft
+	histDraft string // draft saved while browsing history
+
 	streaming   bool
 	printedAsst bool
 	turn        int
@@ -119,16 +126,16 @@ type tuiModel struct {
 	appCtx    context.Context
 }
 
-func runTUI(ctx context.Context, a *agent.Agent, toolNames []string, meta sessionMeta, logCh <-chan string) error {
+func runTUI(ctx context.Context, a *agent.Agent, toolNames []string, meta sessionMeta, logCh <-chan string, sessionMsgs []message.Message) error {
 	statusCh := make(chan statusSnapMsg, 64)
 	attachStatusHooks(a, statusCh)
-	m := newTUIModel(ctx, a, toolNames, meta, logCh, statusCh)
+	m := newTUIModel(ctx, a, toolNames, meta, logCh, statusCh, sessionMsgs)
 	p := tea.NewProgram(m, tea.WithAltScreen(), tea.WithMouseCellMotion(), tea.WithContext(ctx))
 	_, err := p.Run()
 	return err
 }
 
-func newTUIModel(ctx context.Context, a *agent.Agent, toolNames []string, meta sessionMeta, logCh <-chan string, statusCh <-chan statusSnapMsg) *tuiModel {
+func newTUIModel(ctx context.Context, a *agent.Agent, toolNames []string, meta sessionMeta, logCh <-chan string, statusCh <-chan statusSnapMsg, sessionMsgs []message.Message) *tuiModel {
 	ti := textarea.New()
 	ti.Placeholder = "Message the assistant… (/quit to exit)"
 	ti.Prompt = "❯ "
@@ -137,6 +144,12 @@ func newTUIModel(ctx context.Context, a *agent.Agent, toolNames []string, meta s
 	ti.SetHeight(3)
 	ti.Focus()
 	ti.KeyMap.InsertNewline.SetEnabled(false)
+	// ↑/↓ reserved for input history (not in-textarea line nav).
+	ti.KeyMap.LinePrevious.SetEnabled(false)
+	ti.KeyMap.LineNext.SetEnabled(false)
+
+	histPath := historyPath()
+	hist := loadInputHistory(histPath)
 
 	m := &tuiModel{
 		agent:      a,
@@ -152,6 +165,9 @@ func newTUIModel(ctx context.Context, a *agent.Agent, toolNames []string, meta s
 		logsVP:     viewport.New(0, 0),
 		input:      ti,
 		chatFollow: true,
+		histPath:   histPath,
+		hist:       hist,
+		histIdx:    len(hist),
 		logCh:      logCh,
 		statusCh:   statusCh,
 		appCtx:     ctx,
@@ -168,10 +184,22 @@ func newTUIModel(ctx context.Context, a *agent.Agent, toolNames []string, meta s
 	if len(toolNames) > 0 {
 		intro = append(intro, "tools: "+strings.Join(toolNames, ", "))
 	}
-	intro = append(intro, "", "Type a message and press Enter. Tab focuses panes; ? toggles help.",
+	intro = append(intro, "", "Type a message and press Enter. ↑/↓ recall input history; ? toggles help.",
 		"Assistant replies are rendered as Markdown.")
 	m.chat = []chatEntry{{kind: chatPlain, text: strings.Join(intro, "\n")}}
-	m.syncViewports(false)
+
+	if len(sessionMsgs) > 0 {
+		loaded, tools := sessionToChat(sessionMsgs)
+		if len(loaded) > 0 {
+			m.chat = append(m.chat, chatEntry{kind: chatPlain, text: "── session history ──"})
+			m.chat = append(m.chat, loaded...)
+		}
+		m.toolLines = tools
+		m.ctxMsgs = len(sessionMsgs)
+		m.ctxTokens = memory.EstimateTokens(sessionMsgs)
+	}
+
+	m.syncViewports(true)
 	return m
 }
 
@@ -290,9 +318,65 @@ func (m *tuiModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.submitInput()
 	}
 
+	// Input history (↑/↓) when the prompt is focused.
+	if key.Matches(msg, m.keys.ScrollUp) {
+		m.historyPrev()
+		return m, nil
+	}
+	if key.Matches(msg, m.keys.ScrollDown) {
+		m.historyNext()
+		return m, nil
+	}
+
 	var cmd tea.Cmd
 	m.input, cmd = m.input.Update(msg)
 	return m, cmd
+}
+
+func (m *tuiModel) historyPrev() {
+	if len(m.hist) == 0 {
+		return
+	}
+	if m.histIdx == len(m.hist) {
+		m.histDraft = m.input.Value()
+	}
+	if m.histIdx <= 0 {
+		return
+	}
+	m.histIdx--
+	m.input.SetValue(m.hist[m.histIdx])
+	m.input.CursorEnd()
+}
+
+func (m *tuiModel) historyNext() {
+	if m.histIdx >= len(m.hist) {
+		return
+	}
+	m.histIdx++
+	if m.histIdx >= len(m.hist) {
+		m.input.SetValue(m.histDraft)
+	} else {
+		m.input.SetValue(m.hist[m.histIdx])
+	}
+	m.input.CursorEnd()
+}
+
+func (m *tuiModel) pushHistory(text string) {
+	if text == "" {
+		return
+	}
+	if n := len(m.hist); n > 0 && m.hist[n-1] == text {
+		m.histIdx = n
+		m.histDraft = ""
+		return
+	}
+	m.hist = append(m.hist, text)
+	if len(m.hist) > maxInputHistory {
+		m.hist = m.hist[len(m.hist)-maxInputHistory:]
+	}
+	m.histIdx = len(m.hist)
+	m.histDraft = ""
+	_ = saveInputHistory(m.histPath, m.hist)
 }
 
 func (m *tuiModel) submitInput() (tea.Model, tea.Cmd) {
@@ -304,6 +388,7 @@ func (m *tuiModel) submitInput() (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	m.input.Reset()
+	m.pushHistory(text)
 	switch {
 	case text == "/quit" || text == "/exit" || text == "/q":
 		return m, tea.Quit

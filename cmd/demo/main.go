@@ -190,7 +190,8 @@ func realMain(cfg demoConfig) error {
 
 	if interactive {
 		if useTUI {
-			return runTUI(ctx, a, toolNames, meta, logCh)
+			sessionMsgs := loadSessionMessages(wd, sid)
+			return runTUI(ctx, a, toolNames, meta, logCh, sessionMsgs)
 		}
 		return runInteractive(ctx, a, toolNames)
 	}
