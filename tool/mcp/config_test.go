@@ -150,3 +150,55 @@ func TestParseConfigBearerAuthField(t *testing.T) {
 		t.Fatalf("auth=%q", cfg.MCPServers["s"].Auth)
 	}
 }
+
+func TestParseConfigProxyHTTPAndSOCKS5(t *testing.T) {
+	cfg, err := ezmcp.ParseConfig([]byte(`{
+  "mcpServers": {
+    "http_proxy": {
+      "type": "http",
+      "url": "https://example.com/mcp",
+      "proxy": "http://127.0.0.1:7890"
+    },
+    "socks": {
+      "type": "sse",
+      "url": "https://example.com/sse",
+      "proxy": "socks5://user:pass@127.0.0.1:1080"
+    }
+  }
+}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.MCPServers["http_proxy"].Proxy != "http://127.0.0.1:7890" {
+		t.Fatalf("http proxy=%q", cfg.MCPServers["http_proxy"].Proxy)
+	}
+	if cfg.MCPServers["socks"].Proxy != "socks5://user:pass@127.0.0.1:1080" {
+		t.Fatalf("socks proxy=%q", cfg.MCPServers["socks"].Proxy)
+	}
+}
+
+func TestParseConfigProxyRejectedOnStdio(t *testing.T) {
+	_, err := ezmcp.ParseConfig([]byte(`{
+  "mcpServers": {
+    "local": {
+      "command": "npx",
+      "args": ["-y", "x"],
+      "proxy": "http://127.0.0.1:7890"
+    }
+  }
+}`))
+	if err == nil {
+		t.Fatal("expected error")
+	}
+}
+
+func TestParseConfigProxyBadScheme(t *testing.T) {
+	_, err := ezmcp.ParseConfig([]byte(`{
+  "mcpServers": {
+    "s": {"url": "https://example.com/mcp", "proxy": "ftp://127.0.0.1:21"}
+  }
+}`))
+	if err == nil {
+		t.Fatal("expected error")
+	}
+}

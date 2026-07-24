@@ -66,6 +66,13 @@ func DialHTTP(ctx context.Context, url string, opts ...Option) (*Client, error) 
 	if h := o.httpHeaders(); len(h) > 0 {
 		httpOpts = append(httpOpts, transport.WithHTTPHeaders(h))
 	}
+	if o.proxy != "" {
+		hc, err := httpClientForProxy(o.proxy)
+		if err != nil {
+			return nil, fmt.Errorf("mcp http proxy: %w", err)
+		}
+		httpOpts = append(httpOpts, transport.WithHTTPBasicClient(hc))
+	}
 	inner, err := mcpclient.NewStreamableHttpClient(url, httpOpts...)
 	if err != nil {
 		return nil, err
@@ -83,6 +90,13 @@ func DialSSE(ctx context.Context, url string, opts ...Option) (*Client, error) {
 	var sseOpts []transport.ClientOption
 	if h := o.httpHeaders(); len(h) > 0 {
 		sseOpts = append(sseOpts, mcpclient.WithHeaders(h))
+	}
+	if o.proxy != "" {
+		hc, err := httpClientForProxy(o.proxy)
+		if err != nil {
+			return nil, fmt.Errorf("mcp sse proxy: %w", err)
+		}
+		sseOpts = append(sseOpts, mcpclient.WithHTTPClient(hc))
 	}
 	inner, err := mcpclient.NewSSEMCPClient(url, sseOpts...)
 	if err != nil {

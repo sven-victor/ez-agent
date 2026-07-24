@@ -16,7 +16,8 @@ import (
 //	    "devops": {
 //	      "type": "http",
 //	      "url": "https://example.com/mcp",
-//	      "headers": {"Authorization": "Bearer ..."}
+//	      "headers": {"Authorization": "Bearer ..."},
+//	      "proxy": "socks5://127.0.0.1:1080"
 //	    },
 //	    "local": {
 //	      "command": "npx",
@@ -30,7 +31,7 @@ type Config struct {
 }
 
 // ServerConfig describes one MCP server entry.
-// Remote servers use url (+ optional headers / auth / transport|type).
+// Remote servers use url (+ optional headers / auth / proxy / transport|type).
 // Stdio servers use command (+ optional args / env / cwd).
 type ServerConfig struct {
 	// Stdio
@@ -44,6 +45,10 @@ type ServerConfig struct {
 	Headers map[string]string `json:"headers,omitempty"`
 	// Auth is a bearer token string, or the literal "oauth" (unsupported here).
 	Auth string `json:"auth,omitempty"`
+	// Proxy is an optional proxy URL for HTTP / SSE transports.
+	// Supported schemes: http, https, socks5, socks5h
+	// (e.g. "http://127.0.0.1:7890", "socks5://user:pass@127.0.0.1:1080").
+	Proxy string `json:"proxy,omitempty"`
 
 	// Transport is "stdio" | "http" | "streamable-http" | "sse".
 	// Type is an alias used by some clients (e.g. Cursor).
@@ -114,6 +119,9 @@ func (s ServerConfig) validate(name string) error {
 		if strings.TrimSpace(s.Command) == "" {
 			return fmt.Errorf("mcp server %q: stdio requires command", name)
 		}
+		if strings.TrimSpace(s.Proxy) != "" {
+			return fmt.Errorf("mcp server %q: proxy is only supported for http/sse transports", name)
+		}
 	case transportHTTP, transportSSE:
 		if strings.TrimSpace(s.URL) == "" {
 			return fmt.Errorf("mcp server %q: %s requires url", name, kind)
@@ -121,6 +129,11 @@ func (s ServerConfig) validate(name string) error {
 	}
 	if s.Auth == "oauth" {
 		return fmt.Errorf("mcp server %q: auth \"oauth\" is not supported", name)
+	}
+	if p := strings.TrimSpace(s.Proxy); p != "" {
+		if _, err := parseProxyURL(p); err != nil {
+			return fmt.Errorf("mcp server %q: %w", name, err)
+		}
 	}
 	return nil
 }
@@ -179,6 +192,9 @@ func (s ServerConfig) dialOptions(name string) []Option {
 	}
 	if s.Auth != "" && s.Auth != "oauth" {
 		opts = append(opts, WithBearerAuth(s.Auth))
+	}
+	if p := strings.TrimSpace(s.Proxy); p != "" {
+		opts = append(opts, WithProxy(p))
 	}
 	if len(s.Env) > 0 {
 		opts = append(opts, WithEnv(s.Env))

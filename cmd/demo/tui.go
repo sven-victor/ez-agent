@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	glamour "charm.land/glamour/v2"
 	"github.com/charmbracelet/bubbles/key"
 	"github.com/charmbracelet/bubbles/textarea"
 	"github.com/charmbracelet/bubbles/viewport"
@@ -15,7 +16,6 @@ import (
 
 	"github.com/sven-victor/ez-agent/agent"
 	"github.com/sven-victor/ez-agent/event"
-	"github.com/sven-victor/ez-agent/memory"
 	"github.com/sven-victor/ez-agent/run"
 )
 
@@ -95,10 +95,13 @@ type tuiModel struct {
 	logsVP  viewport.Model
 	input   textarea.Model
 
-	chatLines  []string
+	chat       []chatEntry
 	toolLines  []string
 	logLines   []string
 	chatFollow bool
+
+	mdRender *glamour.TermRenderer
+	mdWidth  int
 
 	streaming   bool
 	printedAsst bool
@@ -108,7 +111,8 @@ type tuiModel struct {
 	ctxTokens   int
 	errText     string
 
-	logCh <-chan string
+	logCh    <-chan string
+	statusCh <-chan statusSnapMsg
 
 	runCancel context.CancelFunc
 	runMu     sync.Mutex
@@ -116,13 +120,15 @@ type tuiModel struct {
 }
 
 func runTUI(ctx context.Context, a *agent.Agent, toolNames []string, meta sessionMeta, logCh <-chan string) error {
-	m := newTUIModel(ctx, a, toolNames, meta, logCh)
+	statusCh := make(chan statusSnapMsg, 64)
+	attachStatusHooks(a, statusCh)
+	m := newTUIModel(ctx, a, toolNames, meta, logCh, statusCh)
 	p := tea.NewProgram(m, tea.WithAltScreen(), tea.WithMouseCellMotion(), tea.WithContext(ctx))
 	_, err := p.Run()
 	return err
 }
 
-func newTUIModel(ctx context.Context, a *agent.Agent, toolNames []string, meta sessionMeta, logCh <-chan string) *tuiModel {
+func newTUIModel(ctx context.Context, a *agent.Agent, toolNames []string, meta sessionMeta, logCh <-chan string, statusCh <-chan statusSnapMsg) *tuiModel {
 	ti := textarea.New()
 	ti.Placeholder = "Message the assistant… (/quit to exit)"
 	ti.Prompt = "❯ "
@@ -147,6 +153,7 @@ func newTUIModel(ctx context.Context, a *agent.Agent, toolNames []string, meta s
 		input:      ti,
 		chatFollow: true,
 		logCh:      logCh,
+		statusCh:   statusCh,
 		appCtx:     ctx,
 	}
 	m.chatVP.MouseWheelEnabled = true
@@ -161,14 +168,15 @@ func newTUIModel(ctx context.Context, a *agent.Agent, toolNames []string, meta s
 	if len(toolNames) > 0 {
 		intro = append(intro, "tools: "+strings.Join(toolNames, ", "))
 	}
-	intro = append(intro, "", "Type a message and press Enter. Tab focuses panes; ? toggles help.")
-	m.chatLines = intro
+	intro = append(intro, "", "Type a message and press Enter. Tab focuses panes; ? toggles help.",
+		"Assistant replies are rendered as Markdown.")
+	m.chat = []chatEntry{{kind: chatPlain, text: strings.Join(intro, "\n")}}
 	m.syncViewports(false)
 	return m
 }
 
 func (m *tuiModel) Init() tea.Cmd {
-	return tea.Batch(textarea.Blink, m.waitLog())
+	return tea.Batch(textarea.Blink, m.waitLog(), m.waitStatus())
 }
 
 func (m *tuiModel) waitLog() tea.Cmd {
@@ -183,6 +191,27 @@ func (m *tuiModel) waitLog() tea.Cmd {
 		}
 		return logLineMsg(line)
 	}
+}
+
+func (m *tuiModel) waitStatus() tea.Cmd {
+	if m.statusCh == nil {
+		return nil
+	}
+	ch := m.statusCh
+	return func() tea.Msg {
+		snap, ok := <-ch
+		if !ok {
+			return nil
+		}
+		return snap
+	}
+}
+
+func (m *tuiModel) applyStatus(snap statusSnapMsg) {
+	m.ctxMsgs = snap.msgs
+	m.ctxTokens = snap.tokens
+	m.turn = snap.turn
+	m.usage = snap.usage
 }
 
 func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -204,6 +233,10 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case logLineMsg:
 		m.appendLog(string(msg))
 		return m, m.waitLog()
+
+	case statusSnapMsg:
+		m.applyStatus(msg)
+		return m, m.waitStatus()
 
 	case tea.KeyMsg:
 		return m.handleKey(msg)
@@ -280,16 +313,13 @@ func (m *tuiModel) submitInput() (tea.Model, tea.Cmd) {
 		return m, nil
 	case text == "/tools":
 		if len(m.toolNames) == 0 {
-			m.appendChat("(no tools registered)")
+			m.appendPlain("(no tools registered)")
 		} else {
-			m.appendChat("tools:")
-			for _, n := range m.toolNames {
-				m.appendChat("  - " + n)
-			}
+			m.appendPlain("tools:\n  - " + strings.Join(m.toolNames, "\n  - "))
 		}
 		return m, nil
 	case strings.HasPrefix(text, "/"):
-		m.appendChat(fmt.Sprintf("unknown command %q — try /help", text))
+		m.appendPlain(fmt.Sprintf("unknown command %q — try /help", text))
 		return m, nil
 	}
 	return m, m.startRun(text)
@@ -379,7 +409,7 @@ func (m *tuiModel) cycleFocus() {
 
 func (m *tuiModel) startRun(text string) tea.Cmd {
 	m.errText = ""
-	m.appendChat("you> " + text)
+	m.appendUser(text)
 	m.streaming = true
 	m.printedAsst = false
 	m.turn = 0
@@ -407,6 +437,11 @@ func (m *tuiModel) onStreamDone() {
 	m.streaming = false
 	m.printedAsst = false
 	m.setRunCancel(nil)
+	// Finalize markdown cache for the last assistant bubble.
+	if n := len(m.chat); n > 0 && m.chat[n-1].kind == chatAssistant {
+		m.chat[n-1].rendered = ""
+		m.chat[n-1].renderW = 0
+	}
 	m.chatFollow = true
 	m.syncViewports(true)
 	m.focusInputPane()
@@ -416,10 +451,10 @@ func (m *tuiModel) handleStreamEvent(ev event.Event) {
 	switch e := ev.(type) {
 	case event.ModelDelta:
 		if !m.printedAsst {
-			m.appendChat("assistant> " + e.TextDelta)
+			m.beginAssistant(e.TextDelta)
 			m.printedAsst = true
 		} else {
-			m.appendChatDelta(e.TextDelta)
+			m.appendAssistantDelta(e.TextDelta)
 		}
 	case event.ToolStarted:
 		m.printedAsst = false
@@ -430,20 +465,11 @@ func (m *tuiModel) handleStreamEvent(ev event.Event) {
 			status = "err"
 		}
 		m.appendTool(fmt.Sprintf("← %s [%s] %s", e.Call.Name, status, truncate(partsText(e.Result.Content), 200)))
-	case event.ModelFinished:
-		m.turn++
-		m.usage.Add(e.Usage)
-	case event.RunFinished:
-		if e.Result != nil {
-			m.usage = e.Result.Usage
-			m.ctxMsgs = len(e.Result.Messages)
-			m.ctxTokens = memory.EstimateTokens(e.Result.Messages)
-		}
 	case event.RunError:
 		m.errText = e.Err.Error()
-		m.appendChat("error: " + e.Err.Error())
+		m.appendError(e.Err.Error())
 	case event.Cancelled:
-		m.appendChat("(canceled)")
+		m.appendPlain("(canceled)")
 	}
 	m.syncViewports(m.chatFollow)
 }
@@ -463,18 +489,30 @@ func (m *tuiModel) cancelRun() {
 	}
 }
 
-func (m *tuiModel) appendChat(line string) {
-	m.chatLines = append(m.chatLines, line)
+func (m *tuiModel) appendPlain(text string) {
+	m.chat = append(m.chat, chatEntry{kind: chatPlain, text: text})
 	m.syncViewports(m.chatFollow)
 }
 
-func (m *tuiModel) appendChatDelta(delta string) {
-	if len(m.chatLines) == 0 {
-		m.chatLines = append(m.chatLines, delta)
-	} else {
-		m.chatLines[len(m.chatLines)-1] += delta
+func (m *tuiModel) appendUser(text string) {
+	m.chat = append(m.chat, chatEntry{kind: chatUser, text: text})
+}
+
+func (m *tuiModel) appendError(text string) {
+	m.chat = append(m.chat, chatEntry{kind: chatError, text: text})
+}
+
+func (m *tuiModel) beginAssistant(text string) {
+	m.chat = append(m.chat, chatEntry{kind: chatAssistant, text: text})
+}
+
+func (m *tuiModel) appendAssistantDelta(delta string) {
+	if n := len(m.chat); n > 0 && m.chat[n-1].kind == chatAssistant {
+		m.chat[n-1].text += delta
+		m.chat[n-1].rendered = ""
+		return
 	}
-	m.syncViewports(m.chatFollow)
+	m.beginAssistant(delta)
 }
 
 func (m *tuiModel) appendTool(line string) {
@@ -495,7 +533,7 @@ func (m *tuiModel) appendLog(line string) {
 }
 
 func (m *tuiModel) syncViewports(followChat bool) {
-	m.chatVP.SetContent(strings.Join(m.chatLines, "\n"))
+	m.chatVP.SetContent(m.renderChatContent())
 	if followChat {
 		m.chatVP.GotoBottom()
 	}

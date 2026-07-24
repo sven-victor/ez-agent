@@ -115,7 +115,8 @@ Example `mcp.json` (FastMCP / Cursor canonical `mcpServers` format):
       "url": "https://example.com/mcp",
       "headers": {
         "Authorization": "Bearer ..."
-      }
+      },
+      "proxy": "socks5://127.0.0.1:1080"
     },
     "local": {
       "command": "npx",
@@ -126,6 +127,7 @@ Example `mcp.json` (FastMCP / Cursor canonical `mcpServers` format):
 ```
 
 Config-file servers prefix tool names with `<server>_` (e.g. `devops_list_pods`).
+Remote HTTP/SSE entries may set `proxy` to an `http`/`https`/`socks5`/`socks5h` URL.
 
 Built-in tools: `current_time`, `format_time`, `random_string`. Slash commands in the REPL: `/help`, `/tools`, `/quit`. Interactive input uses readline (↑/↓ history, ←/→ cursor, CJK-aware backspace); history is stored under `.sessions/demo_history`.
 

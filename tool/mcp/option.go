@@ -9,6 +9,7 @@ type dialOpts struct {
 	env     map[string]string
 	cwd     string
 	prefix  string
+	proxy   string // http/https/socks5/socks5h URL for HTTP / SSE
 }
 
 // WithHeaders sets static HTTP headers (HTTP / SSE).
@@ -29,6 +30,12 @@ func WithHeaders(headers map[string]string) Option {
 // WithBearerAuth sets Authorization: Bearer <token> unless Authorization is already present.
 func WithBearerAuth(token string) Option {
 	return func(o *dialOpts) { o.auth = token }
+}
+
+// WithProxy sets an HTTP or SOCKS5 proxy URL for HTTP / SSE transports.
+// Examples: "http://127.0.0.1:7890", "socks5://127.0.0.1:1080".
+func WithProxy(proxyURL string) Option {
+	return func(o *dialOpts) { o.proxy = proxyURL }
 }
 
 // WithEnv sets extra environment variables for a stdio server (KEY=value overlay).

@@ -5,6 +5,7 @@ go 1.25.0
 require (
 	github.com/coder/websocket v1.8.13
 	github.com/mark3labs/mcp-go v0.41.1
+	golang.org/x/net v0.57.0
 	golang.org/x/sync v0.10.0
 )
 
