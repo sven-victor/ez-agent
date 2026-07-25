@@ -417,6 +417,15 @@ Default capabilities (override with `WithCaps`):
 
 `model.Validate` rejects unsupported Parts / System.Parts / OutputSchema when Caps disallow them. Cross-adapter fixtures live in `model/conform`.
 
+`model.Result` includes wire capture for each invocation:
+
+| Field | Meaning |
+|-------|---------|
+| `RawRequest` | JSON body sent to the provider |
+| `RawResponse` | Full JSON body for `Complete`; for `Stream` (SSE), newline-joined payloads after each `data:` line (including `[DONE]` when present) |
+
+Available on each `Stream`/`Complete` return value and via `AfterModel.Result`.
+
 Sentinel errors: `model.ErrUnsupportedPart`, `model.ErrOverflow`, `model.ErrThrottled`.
 
 ## Hooks and plugins

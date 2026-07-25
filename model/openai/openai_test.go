@@ -81,6 +81,16 @@ func TestOpenAIStreamTextAndTools(t *testing.T) {
 	if len(deltas) == 0 {
 		t.Fatal("expected deltas")
 	}
+	if len(res.RawRequest) == 0 || !strings.Contains(string(res.RawRequest), `"stream":true`) {
+		t.Fatalf("RawRequest=%s", res.RawRequest)
+	}
+	rawResp := string(res.RawResponse)
+	if !strings.Contains(rawResp, `"content":"Hi"`) || !strings.Contains(rawResp, "[DONE]") {
+		t.Fatalf("RawResponse=%s", rawResp)
+	}
+	if strings.Contains(rawResp, "data:") {
+		t.Fatal("RawResponse should store data payloads without data: prefix")
+	}
 }
 
 func TestOpenAICompleteTextAndTools(t *testing.T) {
@@ -144,5 +154,11 @@ func TestOpenAICompleteTextAndTools(t *testing.T) {
 	}
 	if res.Usage.TotalTokens != 3 {
 		t.Fatalf("usage=%v", res.Usage)
+	}
+	if len(res.RawRequest) == 0 || strings.Contains(string(res.RawRequest), `"stream":true`) {
+		t.Fatalf("RawRequest=%s", res.RawRequest)
+	}
+	if !strings.Contains(string(res.RawResponse), `"content":"Hi"`) {
+		t.Fatalf("RawResponse=%s", res.RawResponse)
 	}
 }

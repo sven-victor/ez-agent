@@ -86,35 +86,39 @@ func (p *Provider) Caps() model.Capabilities { return p.caps }
 
 // Stream runs a Messages API request with stream=true.
 func (p *Provider) Stream(ctx context.Context, req model.Request, yield func(event.Event) error) (model.Result, error) {
-	resp, err := p.doMessages(ctx, req, true)
+	rawReq, resp, err := p.doMessages(ctx, req, true)
 	if err != nil {
-		return model.Result{}, err
+		return model.Result{RawRequest: rawReq}, err
 	}
 	defer resp.Body.Close()
-	return decodeStream(resp.Body, yield)
+	res, err := decodeStream(resp.Body, yield)
+	res.RawRequest = rawReq
+	return res, err
 }
 
 // Complete runs a Messages API request with stream=false.
 func (p *Provider) Complete(ctx context.Context, req model.Request) (model.Result, error) {
-	resp, err := p.doMessages(ctx, req, false)
+	rawReq, resp, err := p.doMessages(ctx, req, false)
 	if err != nil {
-		return model.Result{}, err
+		return model.Result{RawRequest: rawReq}, err
 	}
 	defer resp.Body.Close()
-	return decodeComplete(resp.Body)
+	res, err := decodeComplete(resp.Body)
+	res.RawRequest = rawReq
+	return res, err
 }
 
-func (p *Provider) doMessages(ctx context.Context, req model.Request, stream bool) (*http.Response, error) {
+func (p *Provider) doMessages(ctx context.Context, req model.Request, stream bool) ([]byte, *http.Response, error) {
 	if err := model.Validate(p, req); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	body, err := encodeRequest(p.model, req, stream)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, p.baseURL+"/v1/messages", bytes.NewReader(body))
 	if err != nil {
-		return nil, err
+		return body, nil, err
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("anthropic-version", apiVersion)
@@ -127,20 +131,20 @@ func (p *Provider) doMessages(ctx context.Context, req model.Request, stream boo
 
 	resp, err := p.httpClient.Do(httpReq)
 	if err != nil {
-		return nil, err
+		return body, nil, err
 	}
 	if resp.StatusCode >= 400 {
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		_ = resp.Body.Close()
 		if isOverflow(resp.StatusCode, b) {
-			return nil, fmt.Errorf("%w: %s", model.ErrOverflow, string(b))
+			return body, nil, fmt.Errorf("%w: %s", model.ErrOverflow, string(b))
 		}
 		if isThrottled(resp.StatusCode, b) {
-			return nil, fmt.Errorf("%w: %s", model.ErrThrottled, string(b))
+			return body, nil, fmt.Errorf("%w: %s", model.ErrThrottled, string(b))
 		}
-		return nil, fmt.Errorf("anthropic: HTTP %d: %s", resp.StatusCode, string(b))
+		return body, nil, fmt.Errorf("anthropic: HTTP %d: %s", resp.StatusCode, string(b))
 	}
-	return resp, nil
+	return body, resp, nil
 }
 
 func isOverflow(code int, body []byte) bool {
@@ -529,6 +533,7 @@ func decodeStream(r io.Reader, yield func(event.Event) error) (model.Result, err
 	var stopReason string
 	var usage run.Usage
 	var eventName string
+	var rawResp bytes.Buffer
 
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -540,6 +545,10 @@ func decodeStream(r io.Reader, yield func(event.Event) error) (model.Result, err
 			continue
 		}
 		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		if rawResp.Len() > 0 {
+			rawResp.WriteByte('\n')
+		}
+		rawResp.WriteString(data)
 		if data == "" || data == "[DONE]" {
 			continue
 		}
@@ -661,7 +670,7 @@ func decodeStream(r io.Reader, yield func(event.Event) error) (model.Result, err
 	}
 
 	stop := mapStopReason(stopReason, hasTools)
-	res := model.Result{Message: msg, StopReason: stop, Usage: usage}
+	res := model.Result{Message: msg, StopReason: stop, Usage: usage, RawResponse: rawResp.Bytes()}
 	if yield != nil {
 		if err := yield(event.ModelFinished{Message: msg, StopReason: stop, Usage: usage}); err != nil {
 			return model.Result{}, err
@@ -688,9 +697,13 @@ type completeResponse struct {
 }
 
 func decodeComplete(r io.Reader) (model.Result, error) {
-	var resp completeResponse
-	if err := json.NewDecoder(r).Decode(&resp); err != nil {
+	raw, err := io.ReadAll(r)
+	if err != nil {
 		return model.Result{}, err
+	}
+	var resp completeResponse
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		return model.Result{RawResponse: raw}, err
 	}
 	msg := message.Message{Role: message.RoleAssistant}
 	hasTools := false
@@ -717,8 +730,8 @@ func decodeComplete(r io.Reader) (model.Result, error) {
 				Input: input,
 			})
 		default:
-			raw, _ := json.Marshal(block)
-			msg.Parts = append(msg.Parts, message.Opaque{Vendor: "anthropic", Data: raw})
+			blockRaw, _ := json.Marshal(block)
+			msg.Parts = append(msg.Parts, message.Opaque{Vendor: "anthropic", Data: blockRaw})
 		}
 	}
 	var usage run.Usage
@@ -730,9 +743,10 @@ func decodeComplete(r io.Reader) (model.Result, error) {
 		}
 	}
 	return model.Result{
-		Message:    msg,
-		StopReason: mapStopReason(resp.StopReason, hasTools),
-		Usage:      usage,
+		Message:     msg,
+		StopReason:  mapStopReason(resp.StopReason, hasTools),
+		Usage:       usage,
+		RawResponse: raw,
 	}, nil
 }
 

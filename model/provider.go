@@ -58,4 +58,10 @@ type Result struct {
 	Message    message.Message
 	StopReason run.StopReason
 	Usage      run.Usage
+	// RawRequest is the provider wire JSON body sent for this invocation (when available).
+	RawRequest []byte
+	// RawResponse is the provider wire response for this invocation.
+	// For SSE streams, adapters append each data: payload (newline-separated) as lines are parsed.
+	// For Complete, it is the full response body.
+	RawResponse []byte
 }

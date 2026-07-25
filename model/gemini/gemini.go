@@ -69,31 +69,35 @@ func (p *Provider) Name() string             { return "gemini" }
 func (p *Provider) Caps() model.Capabilities { return p.caps }
 
 func (p *Provider) Stream(ctx context.Context, req model.Request, yield func(event.Event) error) (model.Result, error) {
-	resp, err := p.doGenerate(ctx, req, true)
+	rawReq, resp, err := p.doGenerate(ctx, req, true)
 	if err != nil {
-		return model.Result{}, err
+		return model.Result{RawRequest: rawReq}, err
 	}
 	defer resp.Body.Close()
-	return decodeStream(resp.Body, yield)
+	res, err := decodeStream(resp.Body, yield)
+	res.RawRequest = rawReq
+	return res, err
 }
 
 // Complete runs a non-streaming generateContent request.
 func (p *Provider) Complete(ctx context.Context, req model.Request) (model.Result, error) {
-	resp, err := p.doGenerate(ctx, req, false)
+	rawReq, resp, err := p.doGenerate(ctx, req, false)
 	if err != nil {
-		return model.Result{}, err
+		return model.Result{RawRequest: rawReq}, err
 	}
 	defer resp.Body.Close()
-	return decodeComplete(resp.Body)
+	res, err := decodeComplete(resp.Body)
+	res.RawRequest = rawReq
+	return res, err
 }
 
-func (p *Provider) doGenerate(ctx context.Context, req model.Request, stream bool) (*http.Response, error) {
+func (p *Provider) doGenerate(ctx context.Context, req model.Request, stream bool) ([]byte, *http.Response, error) {
 	if err := model.Validate(p, req); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	body, err := encodeRequest(req)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	var url string
 	if stream {
@@ -103,7 +107,7 @@ func (p *Provider) doGenerate(ctx context.Context, req model.Request, stream boo
 	}
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
-		return nil, err
+		return body, nil, err
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	if stream {
@@ -112,21 +116,21 @@ func (p *Provider) doGenerate(ctx context.Context, req model.Request, stream boo
 
 	resp, err := p.httpClient.Do(httpReq)
 	if err != nil {
-		return nil, err
+		return body, nil, err
 	}
 	if resp.StatusCode >= 400 {
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		_ = resp.Body.Close()
 		s := strings.ToLower(string(b))
 		if strings.Contains(s, "token") && strings.Contains(s, "limit") || strings.Contains(s, "context") {
-			return nil, fmt.Errorf("%w: %s", model.ErrOverflow, string(b))
+			return body, nil, fmt.Errorf("%w: %s", model.ErrOverflow, string(b))
 		}
 		if resp.StatusCode == 429 {
-			return nil, fmt.Errorf("%w: %s", model.ErrThrottled, string(b))
+			return body, nil, fmt.Errorf("%w: %s", model.ErrThrottled, string(b))
 		}
-		return nil, fmt.Errorf("gemini: HTTP %d: %s", resp.StatusCode, string(b))
+		return body, nil, fmt.Errorf("gemini: HTTP %d: %s", resp.StatusCode, string(b))
 	}
-	return resp, nil
+	return body, resp, nil
 }
 
 type genRequest struct {
@@ -340,6 +344,7 @@ func decodeStream(r io.Reader, yield func(event.Event) error) (model.Result, err
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	acc := &genAcc{}
+	var rawResp bytes.Buffer
 
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -347,6 +352,10 @@ func decodeStream(r io.Reader, yield func(event.Event) error) (model.Result, err
 			continue
 		}
 		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		if rawResp.Len() > 0 {
+			rawResp.WriteByte('\n')
+		}
+		rawResp.WriteString(data)
 		if data == "" || data == "[DONE]" {
 			continue
 		}
@@ -355,13 +364,14 @@ func decodeStream(r io.Reader, yield func(event.Event) error) (model.Result, err
 			continue
 		}
 		if err := acc.apply(chunk, yield); err != nil {
-			return model.Result{}, err
+			return model.Result{RawResponse: rawResp.Bytes()}, err
 		}
 	}
 	if err := scanner.Err(); err != nil {
-		return model.Result{}, err
+		return model.Result{RawResponse: rawResp.Bytes()}, err
 	}
 	res := acc.result()
+	res.RawResponse = rawResp.Bytes()
 	if yield != nil {
 		_ = yield(event.ModelFinished{Message: res.Message, StopReason: res.StopReason, Usage: res.Usage})
 	}
@@ -369,15 +379,21 @@ func decodeStream(r io.Reader, yield func(event.Event) error) (model.Result, err
 }
 
 func decodeComplete(r io.Reader) (model.Result, error) {
-	var resp genResponse
-	if err := json.NewDecoder(r).Decode(&resp); err != nil {
+	raw, err := io.ReadAll(r)
+	if err != nil {
 		return model.Result{}, err
+	}
+	var resp genResponse
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		return model.Result{RawResponse: raw}, err
 	}
 	acc := &genAcc{}
 	if err := acc.apply(resp, nil); err != nil {
-		return model.Result{}, err
+		return model.Result{RawResponse: raw}, err
 	}
-	return acc.result(), nil
+	res := acc.result()
+	res.RawResponse = raw
+	return res, nil
 }
 
 type genResponse struct {

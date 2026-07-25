@@ -90,35 +90,39 @@ func (p *Provider) Caps() model.Capabilities { return p.caps }
 
 // Stream runs a Chat Completions request with stream=true.
 func (p *Provider) Stream(ctx context.Context, req model.Request, yield func(event.Event) error) (model.Result, error) {
-	resp, err := p.doChat(ctx, req, true)
+	rawReq, resp, err := p.doChat(ctx, req, true)
 	if err != nil {
-		return model.Result{}, err
+		return model.Result{RawRequest: rawReq}, err
 	}
 	defer resp.Body.Close()
-	return decodeStream(resp.Body, yield)
+	res, err := decodeStream(resp.Body, yield)
+	res.RawRequest = rawReq
+	return res, err
 }
 
 // Complete runs a Chat Completions request with stream=false.
 func (p *Provider) Complete(ctx context.Context, req model.Request) (model.Result, error) {
-	resp, err := p.doChat(ctx, req, false)
+	rawReq, resp, err := p.doChat(ctx, req, false)
 	if err != nil {
-		return model.Result{}, err
+		return model.Result{RawRequest: rawReq}, err
 	}
 	defer resp.Body.Close()
-	return decodeComplete(resp.Body)
+	res, err := decodeComplete(resp.Body)
+	res.RawRequest = rawReq
+	return res, err
 }
 
-func (p *Provider) doChat(ctx context.Context, req model.Request, stream bool) (*http.Response, error) {
+func (p *Provider) doChat(ctx context.Context, req model.Request, stream bool) ([]byte, *http.Response, error) {
 	if err := model.Validate(p, req); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	body, err := encodeRequest(p.model, req, stream)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, p.baseURL+"/chat/completions", bytes.NewReader(body))
 	if err != nil {
-		return nil, err
+		return body, nil, err
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	if p.apiKey != "" {
@@ -130,20 +134,20 @@ func (p *Provider) doChat(ctx context.Context, req model.Request, stream bool) (
 
 	resp, err := p.httpClient.Do(httpReq)
 	if err != nil {
-		return nil, err
+		return body, nil, err
 	}
 	if resp.StatusCode >= 400 {
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		_ = resp.Body.Close()
 		if isOverflowStatus(resp.StatusCode, b) {
-			return nil, fmt.Errorf("%w: %s", model.ErrOverflow, string(b))
+			return body, nil, fmt.Errorf("%w: %s", model.ErrOverflow, string(b))
 		}
 		if isThrottledStatus(resp.StatusCode, b) {
-			return nil, fmt.Errorf("%w: %s", model.ErrThrottled, string(b))
+			return body, nil, fmt.Errorf("%w: %s", model.ErrThrottled, string(b))
 		}
-		return nil, fmt.Errorf("openai: HTTP %d: %s", resp.StatusCode, string(b))
+		return body, nil, fmt.Errorf("openai: HTTP %d: %s", resp.StatusCode, string(b))
 	}
-	return resp, nil
+	return body, resp, nil
 }
 
 func isOverflowStatus(code int, body []byte) bool {
@@ -592,6 +596,7 @@ func decodeStream(r io.Reader, yield func(event.Event) error) (model.Result, err
 	toolAcc := map[int]*toolCallAcc{}
 	var finishReason string
 	var usage run.Usage
+	var rawResp bytes.Buffer
 
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -599,6 +604,10 @@ func decodeStream(r io.Reader, yield func(event.Event) error) (model.Result, err
 			continue
 		}
 		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		if rawResp.Len() > 0 {
+			rawResp.WriteByte('\n')
+		}
+		rawResp.WriteString(data)
 		if data == "[DONE]" {
 			break
 		}
@@ -692,9 +701,10 @@ func decodeStream(r io.Reader, yield func(event.Event) error) (model.Result, err
 
 	stop := mapFinishReason(finishReason, len(toolAcc) > 0)
 	res := model.Result{
-		Message:    msg,
-		StopReason: stop,
-		Usage:      usage,
+		Message:     msg,
+		StopReason:  stop,
+		Usage:       usage,
+		RawResponse: rawResp.Bytes(),
 	}
 	if yield != nil {
 		if err := yield(event.ModelFinished{
@@ -735,12 +745,16 @@ type completeResponse struct {
 }
 
 func decodeComplete(r io.Reader) (model.Result, error) {
-	var resp completeResponse
-	if err := json.NewDecoder(r).Decode(&resp); err != nil {
+	raw, err := io.ReadAll(r)
+	if err != nil {
 		return model.Result{}, err
 	}
+	var resp completeResponse
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		return model.Result{RawResponse: raw}, err
+	}
 	if len(resp.Choices) == 0 {
-		return model.Result{}, fmt.Errorf("openai: empty choices in complete response")
+		return model.Result{RawResponse: raw}, fmt.Errorf("openai: empty choices in complete response")
 	}
 	ch := resp.Choices[0]
 	msg := message.Message{Role: message.RoleAssistant}
@@ -751,9 +765,9 @@ func decodeComplete(r io.Reader) (model.Result, error) {
 		msg.Parts = append(msg.Parts, message.Text{Text: text})
 	}
 	if ch.Message.Audio != nil && ch.Message.Audio.Data != "" {
-		raw, err := base64.StdEncoding.DecodeString(ch.Message.Audio.Data)
-		if err == nil && len(raw) > 0 {
-			msg.Parts = append(msg.Parts, message.AudioOut{Blob: message.Blob{MIME: "audio/wav", Bytes: raw}})
+		audioRaw, err := base64.StdEncoding.DecodeString(ch.Message.Audio.Data)
+		if err == nil && len(audioRaw) > 0 {
+			msg.Parts = append(msg.Parts, message.AudioOut{Blob: message.Blob{MIME: "audio/wav", Bytes: audioRaw}})
 		}
 	}
 	for _, tc := range ch.Message.ToolCalls {
@@ -772,9 +786,10 @@ func decodeComplete(r io.Reader) (model.Result, error) {
 		}
 	}
 	return model.Result{
-		Message:    msg,
-		StopReason: mapFinishReason(ch.FinishReason, len(ch.Message.ToolCalls) > 0),
-		Usage:      usage,
+		Message:     msg,
+		StopReason:  mapFinishReason(ch.FinishReason, len(ch.Message.ToolCalls) > 0),
+		Usage:       usage,
+		RawResponse: raw,
 	}, nil
 }
 
