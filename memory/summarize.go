@@ -203,6 +203,10 @@ func (s *Summarize) summarizeOldest(ctx context.Context, st *run.State, allowSeg
 	reactive := allowSegmented
 
 	if err := s.fireBeforeSummary(ctx, st, &input, reactive); err != nil {
+		// BeforeSummary skip/error: still fire AfterSummary, then return the error.
+		if herr := s.fireAfterSummary(ctx, st, message.Message{}, input, reactive, n, run.Usage{}, err); herr != nil {
+			return herr
+		}
 		return err
 	}
 
@@ -222,7 +226,11 @@ func (s *Summarize) summarizeOldest(ctx context.Context, st *run.State, allowSeg
 		usage.Add(segUsage)
 	}
 	if err != nil {
-		return fmt.Errorf("summarize: %w", err)
+		sumErr := fmt.Errorf("summarize: %w", err)
+		if herr := s.fireAfterSummary(ctx, st, summary, input, reactive, n, usage, sumErr); herr != nil {
+			return herr
+		}
+		return sumErr
 	}
 	if summary.Role == "" {
 		summary.Role = message.RoleUser
@@ -237,7 +245,7 @@ func (s *Summarize) summarizeOldest(ctx context.Context, st *run.State, allowSeg
 		"state_usage_total", st.Usage.TotalTokens,
 	)
 
-	if err := s.fireAfterSummary(ctx, st, summary, input, reactive, n, usage); err != nil {
+	if err := s.fireAfterSummary(ctx, st, summary, input, reactive, n, usage, nil); err != nil {
 		return err
 	}
 	return nil
@@ -264,7 +272,7 @@ func (s *Summarize) fireBeforeSummary(ctx context.Context, st *run.State, input 
 	return nil
 }
 
-func (s *Summarize) fireAfterSummary(ctx context.Context, st *run.State, summary message.Message, input []message.Message, reactive bool, beforeCount int, usage run.Usage) error {
+func (s *Summarize) fireAfterSummary(ctx context.Context, st *run.State, summary message.Message, input []message.Message, reactive bool, beforeCount int, usage run.Usage, callErr error) error {
 	if s.Hooks == nil {
 		return nil
 	}
@@ -276,11 +284,13 @@ func (s *Summarize) fireAfterSummary(ctx context.Context, st *run.State, summary
 		BeforeCount: beforeCount,
 		AfterCount:  len(st.Messages),
 		Usage:       usage,
+		Err:         callErr,
 	}
 	if err := s.Hooks.FireAfterSummary(ctx, e); err != nil {
 		return err
 	}
-	if e.ReplaceSummary != nil {
+	// ReplaceSummary only applies on success.
+	if callErr == nil && e.ReplaceSummary != nil {
 		rs := *e.ReplaceSummary
 		if rs.Role == "" {
 			rs.Role = message.RoleUser

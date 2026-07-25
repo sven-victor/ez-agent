@@ -27,10 +27,12 @@ type BeforeModel struct {
 	Request model.Request
 }
 
-// AfterModel is fired after each model call.
+// AfterModel is fired after each model call attempt (success or failure).
+// On failure, Err is set and Result may be zero; Retry/ReplaceMessage are ignored.
 type AfterModel struct {
 	State          *run.State
 	Result         model.Result
+	Err            error // non-nil when the provider call (or post-processing) failed
 	Retry          bool
 	ReplaceMessage *message.Message
 }
@@ -66,18 +68,20 @@ type BeforeSummary struct {
 	Skip bool
 }
 
-// AfterSummary is fired after a successful summarization has been applied to State.Messages.
-// State.Usage already includes Usage from this summarization attempt.
+// AfterSummary is fired after each summarization attempt (success or failure).
+// On success, Summary is applied to State.Messages and State.Usage includes Usage.
+// On failure, Err is set; ReplaceSummary is ignored.
 type AfterSummary struct {
 	State       *run.State
 	Summary     message.Message
-	Input       []message.Message // messages that were summarized
+	Input       []message.Message // messages that were summarized (or attempted)
 	Reactive    bool
 	BeforeCount int // len(State.Messages) before summarization
-	AfterCount  int // len(State.Messages) after summarization
+	AfterCount  int // len(State.Messages) after summarization (unchanged on failure)
 	// Usage is token consumption from summarizer model call(s) in this attempt.
 	Usage run.Usage
-	// ReplaceSummary, when set, replaces the summary message at Messages[0].
+	Err   error // non-nil when summarization failed or was skipped
+	// ReplaceSummary, when set on success, replaces the summary message at Messages[0].
 	ReplaceSummary *message.Message
 }
 

@@ -2,6 +2,7 @@ package memory_test
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
@@ -10,6 +11,12 @@ import (
 	"github.com/sven-victor/ez-agent/message"
 	"github.com/sven-victor/ez-agent/run"
 )
+
+type failSummarizer struct{}
+
+func (failSummarizer) Summarize(ctx context.Context, msgs []message.Message) (message.Message, run.Usage, error) {
+	return message.Message{}, run.Usage{}, errors.New("summarizer boom")
+}
 
 func TestSummarizeFiresSummaryHooks(t *testing.T) {
 	st := &run.State{}
@@ -79,8 +86,17 @@ func TestSummarizeBeforeSummarySkip(t *testing.T) {
 	before := len(st.Messages)
 
 	h := hook.NewRegistry()
+	var afterErr error
+	var afterCalls int
 	h.OnBeforeSummary(func(ctx context.Context, e *hook.BeforeSummary) error {
 		e.Skip = true
+		return nil
+	})
+	h.OnAfterSummary(func(ctx context.Context, e *hook.AfterSummary) error {
+		afterCalls++
+		afterErr = e.Err
+		repl := message.NewUserText("should-not-apply")
+		e.ReplaceSummary = &repl
 		return nil
 	})
 	pol := &memory.Summarize{
@@ -95,6 +111,48 @@ func TestSummarizeBeforeSummarySkip(t *testing.T) {
 	}
 	if len(st.Messages) != before {
 		t.Fatalf("skip should leave messages untouched: before=%d after=%d", before, len(st.Messages))
+	}
+	if afterCalls != 1 {
+		t.Fatalf("AfterSummary calls=%d", afterCalls)
+	}
+	if afterErr == nil {
+		t.Fatal("expected AfterSummary.Err on skip")
+	}
+	if message.TextContent(st.Messages[0]) == "should-not-apply" {
+		t.Fatal("ReplaceSummary must be ignored when AfterSummary.Err is set")
+	}
+}
+
+func TestSummarizeAfterSummaryOnFailure(t *testing.T) {
+	st := &run.State{}
+	var msgs []message.Message
+	for i := 0; i < 20; i++ {
+		msgs = append(msgs, message.NewUserText("m"))
+	}
+	st.InitHistory(msgs)
+	before := len(st.Messages)
+
+	h := hook.NewRegistry()
+	var afterErr error
+	h.OnAfterSummary(func(ctx context.Context, e *hook.AfterSummary) error {
+		afterErr = e.Err
+		return nil
+	})
+	pol := &memory.Summarize{
+		Summarizer: failSummarizer{},
+		Ratio:      0.3,
+		KeepRecent: 10,
+		Hooks:      h,
+	}
+	// Reduce falls back to dropping oldest messages when summarizer fails.
+	if err := pol.Reduce(context.Background(), st); err != nil {
+		t.Fatal(err)
+	}
+	if afterErr == nil {
+		t.Fatal("expected AfterSummary.Err even when Reduce falls back")
+	}
+	if len(st.Messages) >= before {
+		t.Fatalf("fallback should shrink messages: before=%d after=%d", before, len(st.Messages))
 	}
 }
 

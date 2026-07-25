@@ -44,9 +44,20 @@ func (e *Concurrent) Execute(ctx context.Context, calls []Call) ([]Result, error
 }
 
 func runOne(ctx context.Context, reg Registry, hooks CallHooks, call Call) Result {
+	// AfterTool runs whenever BeforeTool does not fail (including deny/skip,
+	// handler errors, cancel, and unknown tools).
+	after := func(res Result) Result {
+		if hooks == nil {
+			return res
+		}
+		res, _ = hooks.AfterTool(ctx, call, res)
+		return res
+	}
+
 	if hooks != nil {
 		act, err := hooks.BeforeTool(ctx, call)
 		if err != nil {
+			// BeforeTool failed: do not run AfterTool.
 			return errorResult(call, err)
 		}
 		if act.Deny || act.Skip {
@@ -58,15 +69,11 @@ func runOne(ctx context.Context, reg Registry, hooks CallHooks, call Call) Resul
 					reason = "tool skipped by hook"
 				}
 			}
-			res := Result{
+			return after(Result{
 				ToolUseID: call.ID,
 				OK:        false,
 				Content:   []message.Part{message.Text{Text: reason}},
-			}
-			if hooks != nil {
-				res, _ = hooks.AfterTool(ctx, call, res)
-			}
-			return res
+			})
 		}
 		if len(act.ReplaceInput) > 0 {
 			call.Input = act.ReplaceInput
@@ -75,39 +82,29 @@ func runOne(ctx context.Context, reg Registry, hooks CallHooks, call Call) Resul
 
 	select {
 	case <-ctx.Done():
-		return errorResult(call, ctx.Err())
+		return after(errorResult(call, ctx.Err()))
 	default:
 	}
 
 	if reg == nil {
-		return errorResult(call, fmt.Errorf("unknown tool: %s", call.Name))
+		return after(errorResult(call, fmt.Errorf("unknown tool: %s", call.Name)))
 	}
 	h, ok := reg.Lookup(call.Name)
 	if !ok {
-		res := Result{
+		return after(Result{
 			ToolUseID: call.ID,
 			OK:        false,
 			Content:   []message.Part{message.Text{Text: fmt.Sprintf("unknown tool: %s", call.Name)}},
-		}
-		if hooks != nil {
-			res, _ = hooks.AfterTool(ctx, call, res)
-		}
-		return res
+		})
 	}
 
 	res, err := h(ctx, call)
 	if err != nil {
 		res = errorResult(call, err)
-	} else {
-		if res.ToolUseID == "" {
-			res.ToolUseID = call.ID
-		}
+	} else if res.ToolUseID == "" {
+		res.ToolUseID = call.ID
 	}
-
-	if hooks != nil {
-		res, _ = hooks.AfterTool(ctx, call, res)
-	}
-	return res
+	return after(res)
 }
 
 func errorResult(call Call, err error) Result {

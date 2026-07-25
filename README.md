@@ -310,9 +310,9 @@ Each run roughly follows:
 3. Cycle top: check limits / `ctx`
 4. `ContextPolicy.Prepare` → `BeforeModel` → validate capabilities → `Provider.Stream` (or `Complete` when `WithPreferComplete`)
 5. On context overflow → `ContextPolicy.Reduce` (must shrink) → retry (default cap 3)
-6. Sanitize incomplete tool calls; append assistant message; `AfterModel` (may `Retry` / `ReplaceMessage`)
+6. After every model attempt: `AfterModel` (success or failure; on failure `Err` is set). On success: sanitize incomplete tool calls, append assistant message; hooks may `Retry` / `ReplaceMessage` (ignored when `Err != nil`)
 7. If stop is not `tool_use` → finish
-8. Else optional HITL interrupt → else execute tools, append results, `Turn++`, continue
+8. Else optional HITL interrupt → else execute tools (`BeforeTool` / `AfterTool`), append results, `Turn++`, continue
 9. `AfterRun` → return `Result`
 
 Cancel: in-flight tools exit ASAP; unpaired tool uses get synthetic error results so history stays consistent.
@@ -346,8 +346,8 @@ Behavior:
 
 - Same-batch tools run **concurrently** by default (`WithExecutor(&tool.Sequential{})` for ordered)
 - Unknown tool name → `OK=false` result, other tools still run
-- `BeforeTool` may `Deny` / `Skip` / `ReplaceInput`; deny still produces a `ToolResult`
-- `AfterTool` may `ReplaceResult`
+- `BeforeTool` may `Deny` / `Skip` / `ReplaceInput`; deny/skip still produce a `ToolResult`
+- `AfterTool` runs whenever `BeforeTool` does **not** return an error (including handler failure, unknown tool, cancel, deny/skip); it may `ReplaceResult`. If `BeforeTool` itself fails, `AfterTool` is skipped.
 
 ### Live Multi vs snapshot Compose
 
@@ -425,26 +425,32 @@ Sentinel errors: `model.ErrUnsupportedPart`, `model.ErrOverflow`, `model.ErrThro
 h := hook.NewRegistry()
 h.OnBeforeModel(func(ctx context.Context, e *hook.BeforeModel) error { return nil })
 h.OnAfterModel(func(ctx context.Context, e *hook.AfterModel) error {
+    // Always fired after each provider attempt (success or failure).
+    // On failure: e.Err != nil; e.Retry / e.ReplaceMessage are ignored.
+    // On success:
     // e.Retry = true
     // e.ReplaceMessage = &msg
     return nil
 })
 h.OnBeforeTool(func(ctx context.Context, e *hook.BeforeTool) error {
     // e.Deny / e.Skip / e.ReplaceInput
+    // Returning an error skips AfterTool for that call.
     return nil
 })
 h.OnAfterTool(func(ctx context.Context, e *hook.AfterTool) error {
+    // Fired unless BeforeTool returned an error (covers OK=false / cancel / deny).
     // e.ReplaceResult = &result
     return nil
 })
 h.OnBeforeSummary(func(ctx context.Context, e *hook.BeforeSummary) error {
-    // e.Skip = true  // abort this summarization attempt
+    // e.Skip = true  // abort this summarization attempt (AfterSummary still runs with Err)
     // e.Input = ...  // replace summarizer input
     return nil
 })
 h.OnAfterSummary(func(ctx context.Context, e *hook.AfterSummary) error {
-    // e.Usage — summarizer model tokens (also added to e.State.Usage)
-    // e.ReplaceSummary = &msg
+    // Always fired after each summarization attempt (success, skip, or failure).
+    // e.Err != nil on skip/failure; e.ReplaceSummary is ignored then.
+    // On success: e.Usage is added to e.State.Usage; e.ReplaceSummary = &msg
     return nil
 })
 
@@ -454,7 +460,13 @@ agent.New(agent.WithProvider(p), agent.WithHooks(h))
 - **Before\***: registration order  
 - **After\***: reverse registration order (for symmetric cleanup)
 
-Events: `BeforeRun` / `AfterRun`, `BeforeModel` / `AfterModel`, `BeforeTool` / `AfterTool`, `BeforeSummary` / `AfterSummary` (fired by `memory.Summarize` on proactive Prepare / reactive Reduce).
+Events: `BeforeRun` / `AfterRun`, `BeforeModel` / `AfterModel`, `BeforeTool` / `AfterTool`, `BeforeSummary` / `AfterSummary` (summary hooks are fired by `memory.Summarize` on proactive Prepare / reactive Reduce).
+
+| After hook | When it runs | Mutation notes |
+|------------|--------------|----------------|
+| `AfterModel` | After every provider call attempt, success or failure | `Retry` / `ReplaceMessage` only when `Err == nil` |
+| `AfterTool` | After tool path when `BeforeTool` did not fail | `ReplaceResult` always applicable when the hook runs |
+| `AfterSummary` | After every summarization attempt (incl. skip / summarizer error) | `ReplaceSummary` only when `Err == nil` |
 
 Plugins package tools + hooks:
 

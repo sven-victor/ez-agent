@@ -302,6 +302,37 @@ func TestHookAfterModelRetry(t *testing.T) {
 	}
 }
 
+func TestHookAfterModelOnProviderError(t *testing.T) {
+	boom := errors.New("provider down")
+	p := &scriptedProvider{fn: func(n int, req model.Request) (model.Result, error) {
+		return model.Result{}, boom
+	}}
+	h := hook.NewRegistry()
+	var afterErr error
+	var afterCalls int
+	h.OnAfterModel(func(ctx context.Context, e *hook.AfterModel) error {
+		afterCalls++
+		afterErr = e.Err
+		e.Retry = true // ignored on failure
+		return nil
+	})
+	l := loop.New(loop.Config{Provider: p, Hooks: h, MaxModelRetry: 1})
+	st := newState(message.NewUserText("hi"))
+	_, err := l.Run(context.Background(), st, nil)
+	if !errors.Is(err, boom) {
+		t.Fatalf("err=%v", err)
+	}
+	if afterCalls != 1 {
+		t.Fatalf("AfterModel calls=%d", afterCalls)
+	}
+	if !errors.Is(afterErr, boom) {
+		t.Fatalf("AfterModel.Err=%v", afterErr)
+	}
+	if p.calls != 1 {
+		t.Fatalf("provider should not retry from AfterModel.Retry on failure: calls=%d", p.calls)
+	}
+}
+
 func TestPreferComplete(t *testing.T) {
 	var streamed bool
 	p := &scriptedProvider{fn: func(n int, req model.Request) (model.Result, error) {

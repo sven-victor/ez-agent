@@ -201,6 +201,18 @@ func (l *Loop) Run(ctx context.Context, st *run.State, emit EmitFunc) (res *run.
 			"complete", l.cfg.PreferComplete,
 		)
 
+		// fireAfterModel always runs after a provider attempt (success or failure).
+		// On failure, Retry/ReplaceMessage from the hook are ignored by callers.
+		fireAfterModel := func(result model.Result, callErr error) (*hook.AfterModel, error) {
+			after := &hook.AfterModel{State: st, Result: result, Err: callErr}
+			if herr := l.cfg.Hooks.FireAfterModel(ctx, after); herr != nil {
+				log.Error("after-model hook failed", "err", herr)
+				_ = emit(event.RunError{Err: herr})
+				return after, herr
+			}
+			return after, nil
+		}
+
 		var mres model.Result
 		var err error
 		if l.cfg.PreferComplete {
@@ -216,6 +228,9 @@ func (l *Loop) Run(ctx context.Context, st *run.State, emit EmitFunc) (res *run.
 			mres, err = l.cfg.Provider.Stream(ctx, req, emit)
 		}
 		if err != nil {
+			if _, herr := fireAfterModel(mres, err); herr != nil {
+				return nil, herr
+			}
 			if errors.Is(err, model.ErrOverflow) {
 				overflowRetries++
 				log.Warn("context overflow", "attempt", overflowRetries, "max", l.cfg.MaxOverflow, "err", err)
@@ -281,6 +296,9 @@ func (l *Loop) Run(ctx context.Context, st *run.State, emit EmitFunc) (res *run.
 		if len(l.cfg.OutputSchema) > 0 && msg.StopReason != run.StopToolUse {
 			structured, verr := validateStructuredJSON(msg.Message)
 			if verr != nil {
+				if _, herr := fireAfterModel(msg, verr); herr != nil {
+					return nil, herr
+				}
 				modelRetries++
 				log.Warn("structured output invalid", "attempt", modelRetries, "max", l.cfg.MaxModelRetry, "err", verr)
 				if modelRetries > l.cfg.MaxModelRetry {
@@ -291,30 +309,37 @@ func (l *Loop) Run(ctx context.Context, st *run.State, emit EmitFunc) (res *run.
 				}
 				continue
 			}
-			if err := l.appendMessage(ctx, st, msg.Message); err != nil {
-				log.Error("append message failed", "err", err)
-				_ = emit(event.RunError{Err: err})
-				return nil, err
+			if aerr := l.appendMessage(ctx, st, msg.Message); aerr != nil {
+				if _, herr := fireAfterModel(msg, aerr); herr != nil {
+					return nil, herr
+				}
+				log.Error("append message failed", "err", aerr)
+				_ = emit(event.RunError{Err: aerr})
+				return nil, aerr
 			}
 			st.Usage.Add(msg.Usage)
+			if _, herr := fireAfterModel(msg, nil); herr != nil {
+				return nil, herr
+			}
 			res = stop(st, msg.StopReason)
 			res.Structured = structured
 			_ = emit(event.RunFinished{Result: res})
 			return res, nil
 		}
 
-		if err := l.appendMessage(ctx, st, msg.Message); err != nil {
-			log.Error("append message failed", "err", err)
-			_ = emit(event.RunError{Err: err})
-			return nil, err
+		if aerr := l.appendMessage(ctx, st, msg.Message); aerr != nil {
+			if _, herr := fireAfterModel(msg, aerr); herr != nil {
+				return nil, herr
+			}
+			log.Error("append message failed", "err", aerr)
+			_ = emit(event.RunError{Err: aerr})
+			return nil, aerr
 		}
 		st.Usage.Add(msg.Usage)
 
-		after := &hook.AfterModel{State: st, Result: msg}
-		if err := l.cfg.Hooks.FireAfterModel(ctx, after); err != nil {
-			log.Error("after-model hook failed", "err", err)
-			_ = emit(event.RunError{Err: err})
-			return nil, err
+		after, herr := fireAfterModel(msg, nil)
+		if herr != nil {
+			return nil, herr
 		}
 		if after.ReplaceMessage != nil {
 			rm := *after.ReplaceMessage
@@ -325,10 +350,10 @@ func (l *Loop) Run(ctx context.Context, st *run.State, emit EmitFunc) (res *run.
 			st.ReplaceLastMessage(rm)
 			msg.Message = rm
 			log.Debug("after-model replaced message")
-			if err := l.sessionReplaceAll(ctx, st.Messages); err != nil {
-				log.Error("session replace failed", "err", err)
-				_ = emit(event.RunError{Err: err})
-				return nil, err
+			if serr := l.sessionReplaceAll(ctx, st.Messages); serr != nil {
+				log.Error("session replace failed", "err", serr)
+				_ = emit(event.RunError{Err: serr})
+				return nil, serr
 			}
 		}
 		if after.Retry {
@@ -354,10 +379,10 @@ func (l *Loop) Run(ctx context.Context, st *run.State, emit EmitFunc) (res *run.
 				}
 			}
 			st.PopLastMessage()
-			if err := l.sessionReplaceAll(ctx, st.Messages); err != nil {
-				log.Error("session replace failed", "err", err)
-				_ = emit(event.RunError{Err: err})
-				return nil, err
+			if serr := l.sessionReplaceAll(ctx, st.Messages); serr != nil {
+				log.Error("session replace failed", "err", serr)
+				_ = emit(event.RunError{Err: serr})
+				return nil, serr
 			}
 			continue
 		}
