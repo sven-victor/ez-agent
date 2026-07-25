@@ -24,11 +24,13 @@ const defaultBaseURL = "https://api.openai.com/v1"
 
 // Provider is an OpenAI-compatible Chat Completions adapter.
 type Provider struct {
-	apiKey     string
-	baseURL    string
-	model      string
-	httpClient *http.Client
-	caps       model.Capabilities
+	apiKey         string
+	organizationID string
+	baseURL        string
+	model          string
+	httpClient     *http.Client
+	caps           model.Capabilities
+	headers        map[string]string // extra HTTP headers (applied after built-ins)
 }
 
 // Option configures the provider.
@@ -37,6 +39,26 @@ type Option func(*Provider)
 // WithAPIKey sets the API key.
 func WithAPIKey(key string) Option {
 	return func(p *Provider) { p.apiKey = key }
+}
+
+// WithOrganization sets the OpenAI-Organization request header.
+func WithOrganization(org string) Option {
+	return func(p *Provider) { p.organizationID = org }
+}
+
+// WithHeader sets a custom HTTP header on every request.
+// Applied after built-in headers (Authorization, Content-Type, …), so it may override them.
+// Multiple calls accumulate; later values for the same key win.
+func WithHeader(key, value string) Option {
+	return func(p *Provider) {
+		if key == "" {
+			return
+		}
+		if p.headers == nil {
+			p.headers = map[string]string{}
+		}
+		p.headers[key] = value
+	}
 }
 
 // WithBaseURL sets the API base URL (e.g. https://api.openai.com/v1).
@@ -128,8 +150,14 @@ func (p *Provider) doChat(ctx context.Context, req model.Request, stream bool) (
 	if p.apiKey != "" {
 		httpReq.Header.Set("Authorization", "Bearer "+p.apiKey)
 	}
+	if p.organizationID != "" {
+		httpReq.Header.Set("OpenAI-Organization", p.organizationID)
+	}
 	if stream {
 		httpReq.Header.Set("Accept", "text/event-stream")
+	}
+	for k, v := range p.headers {
+		httpReq.Header.Set(k, v)
 	}
 
 	resp, err := p.httpClient.Do(httpReq)

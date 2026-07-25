@@ -32,6 +32,7 @@ type Provider struct {
 	model      string
 	httpClient *http.Client
 	caps       model.Capabilities
+	headers    map[string]string // extra HTTP headers (applied after built-ins)
 }
 
 // Option configures the provider.
@@ -39,6 +40,21 @@ type Option func(*Provider)
 
 func WithAPIKey(key string) Option {
 	return func(p *Provider) { p.apiKey = key }
+}
+
+// WithHeader sets a custom HTTP header on every request.
+// Applied after built-in headers, so it may override them.
+// Multiple calls accumulate; later values for the same key win.
+func WithHeader(key, value string) Option {
+	return func(p *Provider) {
+		if key == "" {
+			return
+		}
+		if p.headers == nil {
+			p.headers = map[string]string{}
+		}
+		p.headers[key] = value
+	}
 }
 
 func WithBaseURL(url string) Option {
@@ -127,6 +143,9 @@ func (p *Provider) doMessages(ctx context.Context, req model.Request, stream boo
 	}
 	if p.apiKey != "" {
 		httpReq.Header.Set("x-api-key", p.apiKey)
+	}
+	for k, v := range p.headers {
+		httpReq.Header.Set(k, v)
 	}
 
 	resp, err := p.httpClient.Do(httpReq)

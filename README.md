@@ -386,6 +386,8 @@ p := openai.New(
     openai.WithAPIKey(key),
     openai.WithBaseURL("https://api.openai.com/v1"),
     openai.WithModel("gpt-4o-mini"),
+    openai.WithOrganization("org-…"),           // optional OpenAI-Organization header
+    openai.WithHeader("OpenAI-Project", "proj_…"), // optional custom headers
     openai.WithHTTPClient(http.DefaultClient),
     openai.WithCaps(…), // optional override
 )
@@ -394,11 +396,13 @@ p := anthropic.New(
     anthropic.WithAPIKey(key),
     anthropic.WithBaseURL("https://api.anthropic.com"), // or a gateway
     anthropic.WithModel("claude-sonnet-4-20250514"),
+    anthropic.WithHeader("anthropic-beta", "…"), // optional custom headers
 )
 
 p := gemini.New(
     gemini.WithAPIKey(key),
     gemini.WithModel("gemini-2.0-flash"),
+    gemini.WithHeader("X-Trace-Id", "…"), // optional custom headers
 )
 ```
 

@@ -75,3 +75,28 @@ func TestGeminiCompleteText(t *testing.T) {
 		t.Fatalf("usage=%v", res.Usage)
 	}
 }
+
+func TestGeminiWithHeader(t *testing.T) {
+	var gotCustom string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotCustom = r.Header.Get("X-Custom")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"candidates":[{"content":{"parts":[{"text":"ok"}]},"finishReason":"STOP"}]}`))
+	}))
+	defer srv.Close()
+
+	p := gemini.New(
+		gemini.WithBaseURL(srv.URL),
+		gemini.WithAPIKey("k"),
+		gemini.WithHeader("X-Custom", "v1"),
+		gemini.WithHTTPClient(srv.Client()),
+	)
+	if _, err := p.Complete(context.Background(), model.Request{
+		Messages: []message.Message{message.NewUserText("hey")},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if gotCustom != "v1" {
+		t.Fatalf("X-Custom=%q", gotCustom)
+	}
+}

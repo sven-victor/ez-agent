@@ -137,3 +137,33 @@ func TestAnthropicCompleteTextAndTools(t *testing.T) {
 		t.Fatalf("input=%s", uses[0].Input)
 	}
 }
+
+func TestAnthropicWithHeader(t *testing.T) {
+	var gotBeta, gotKey string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotBeta = r.Header.Get("anthropic-beta")
+		gotKey = r.Header.Get("x-api-key")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`))
+	}))
+	defer srv.Close()
+
+	p := anthropic.New(
+		anthropic.WithBaseURL(srv.URL),
+		anthropic.WithAPIKey("secret"),
+		anthropic.WithHeader("anthropic-beta", "max-tokens-3-5-2024-07-15"),
+		anthropic.WithHeader("x-api-key", "override"),
+		anthropic.WithHTTPClient(srv.Client()),
+	)
+	if _, err := p.Complete(context.Background(), model.Request{
+		Messages: []message.Message{message.NewUserText("hi")},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if gotBeta != "max-tokens-3-5-2024-07-15" {
+		t.Fatalf("anthropic-beta=%q", gotBeta)
+	}
+	if gotKey != "override" {
+		t.Fatalf("x-api-key=%q", gotKey)
+	}
+}

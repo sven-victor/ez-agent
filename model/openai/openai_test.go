@@ -162,3 +162,38 @@ func TestOpenAICompleteTextAndTools(t *testing.T) {
 		t.Fatalf("RawResponse=%s", res.RawResponse)
 	}
 }
+
+func TestOpenAIOrganizationAndHeaders(t *testing.T) {
+	var gotOrg, gotCustom, gotAuth string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotOrg = r.Header.Get("OpenAI-Organization")
+		gotCustom = r.Header.Get("X-Custom")
+		gotAuth = r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`))
+	}))
+	defer srv.Close()
+
+	p := openai.New(
+		openai.WithBaseURL(srv.URL),
+		openai.WithAPIKey("secret"),
+		openai.WithOrganization("org-abc"),
+		openai.WithHeader("X-Custom", "v1"),
+		openai.WithHeader("Authorization", "Bearer override"), // custom wins over WithAPIKey
+		openai.WithHTTPClient(srv.Client()),
+	)
+	if _, err := p.Complete(context.Background(), model.Request{
+		Messages: []message.Message{message.NewUserText("hi")},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if gotOrg != "org-abc" {
+		t.Fatalf("OpenAI-Organization=%q", gotOrg)
+	}
+	if gotCustom != "v1" {
+		t.Fatalf("X-Custom=%q", gotCustom)
+	}
+	if gotAuth != "Bearer override" {
+		t.Fatalf("Authorization=%q", gotAuth)
+	}
+}
