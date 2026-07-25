@@ -90,13 +90,13 @@ func (s *FileCheckpointStore) Load(_ context.Context, id string) (*run.State, er
 }
 
 type checkpointWire struct {
-	SavedAt    time.Time       `json:"saved_at"`
-	Turn       int             `json:"turn"`
-	Usage      run.Usage       `json:"usage"`
-	Values     map[string]any  `json:"values,omitempty"`
+	SavedAt    time.Time         `json:"saved_at"`
+	Turn       int               `json:"turn"`
+	Usage      run.Usage         `json:"usage"`
+	Values     map[string]any    `json:"values,omitempty"`
 	Pending    *run.PendingTools `json:"pending,omitempty"`
-	Transcript []wireMessage   `json:"transcript"`
-	Messages   []wireMessage   `json:"messages"`
+	Transcript []wireMessage     `json:"transcript"`
+	Messages   []wireMessage     `json:"messages"`
 }
 
 func encodeCheckpoint(st *run.State) (checkpointWire, error) {

@@ -24,6 +24,7 @@ func (fakeSumProvider) Stream(ctx context.Context, req model.Request, yield func
 	return model.Result{
 		Message:    message.NewAssistantText("summary of prior turns"),
 		StopReason: run.StopEndTurn,
+		Usage:      run.Usage{InputTokens: 10, OutputTokens: 5, TotalTokens: 15},
 	}, nil
 }
 func (fakeSumProvider) Complete(ctx context.Context, req model.Request) (model.Result, error) {
@@ -74,6 +75,9 @@ func TestSummarizeReduceReplacesOldest(t *testing.T) {
 	}
 	if st.Messages[0].Role != message.RoleUser {
 		t.Fatalf("summary role=%s", st.Messages[0].Role)
+	}
+	if st.Usage.TotalTokens != 15 {
+		t.Fatalf("expected summary usage on State, got %+v", st.Usage)
 	}
 }
 

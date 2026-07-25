@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/sven-victor/ez-agent/hook"
 	"github.com/sven-victor/ez-agent/logger"
 	"github.com/sven-victor/ez-agent/message"
 	"github.com/sven-victor/ez-agent/run"
@@ -17,8 +18,9 @@ const (
 )
 
 // Summarizer turns a message slice into a single summary message.
+// Usage covers model call(s) made during summarization (zero when no LLM was used).
 type Summarizer interface {
-	Summarize(ctx context.Context, msgs []message.Message) (message.Message, error)
+	Summarize(ctx context.Context, msgs []message.Message) (message.Message, run.Usage, error)
 }
 
 // Summarize replaces the oldest fraction of Messages with an LLM summary.
@@ -47,6 +49,9 @@ type Summarize struct {
 	// Logger receives summarization diagnostics; nil is a no-op.
 	// agent.WithLogger also fills this via SetLogger when unset.
 	Logger logger.Logger
+	// Hooks receives BeforeSummary / AfterSummary around summarizer calls.
+	// agent.New fills this via SetHooks when unset.
+	Hooks *hook.Registry
 }
 
 func (s *Summarize) ratio() float64 {
@@ -194,18 +199,27 @@ func (s *Summarize) summarizeOldest(ctx context.Context, st *run.State, allowSeg
 	toSummarize := st.Messages[:count]
 	remaining := st.Messages[count:]
 	input := s.withIntent(st.Messages, toSummarize)
+	// allowSegmented is only true on Reduce (overflow); Prepare uses false.
+	reactive := allowSegmented
+
+	if err := s.fireBeforeSummary(ctx, st, &input, reactive); err != nil {
+		return err
+	}
 
 	log.Info("summarizing oldest messages",
 		"total", n,
 		"summarize", count,
 		"keep", len(remaining),
 		"allow_segmented", allowSegmented,
+		"input", len(input),
 	)
 
-	summary, err := s.Summarizer.Summarize(ctx, input)
+	summary, usage, err := s.Summarizer.Summarize(ctx, input)
 	if err != nil && allowSegmented && s.Segmented != nil {
 		log.Warn("primary summarizer failed; trying segmented", "err", err)
-		summary, err = s.Segmented.Summarize(ctx, input)
+		var segUsage run.Usage
+		summary, segUsage, err = s.Segmented.Summarize(ctx, input)
+		usage.Add(segUsage)
 	}
 	if err != nil {
 		return fmt.Errorf("summarize: %w", err)
@@ -215,7 +229,67 @@ func (s *Summarize) summarizeOldest(ctx context.Context, st *run.State, allowSeg
 	}
 	message.EnsureID(&summary)
 	st.Messages = append([]message.Message{summary}, remaining...)
-	log.Debug("summary message applied", "remaining", len(remaining), "summary_id", summary.ID)
+	st.Usage.Add(usage)
+	log.Debug("summary message applied",
+		"remaining", len(remaining),
+		"summary_id", summary.ID,
+		"usage_total", usage.TotalTokens,
+		"state_usage_total", st.Usage.TotalTokens,
+	)
+
+	if err := s.fireAfterSummary(ctx, st, summary, input, reactive, n, usage); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (s *Summarize) fireBeforeSummary(ctx context.Context, st *run.State, input *[]message.Message, reactive bool) error {
+	if s.Hooks == nil {
+		return nil
+	}
+	e := &hook.BeforeSummary{
+		State:    st,
+		Input:    append([]message.Message(nil), (*input)...),
+		Reactive: reactive,
+	}
+	if err := s.Hooks.FireBeforeSummary(ctx, e); err != nil {
+		return err
+	}
+	if e.Skip {
+		return fmt.Errorf("summarize: skipped by BeforeSummary hook")
+	}
+	if e.Input != nil {
+		*input = e.Input
+	}
+	return nil
+}
+
+func (s *Summarize) fireAfterSummary(ctx context.Context, st *run.State, summary message.Message, input []message.Message, reactive bool, beforeCount int, usage run.Usage) error {
+	if s.Hooks == nil {
+		return nil
+	}
+	e := &hook.AfterSummary{
+		State:       st,
+		Summary:     summary,
+		Input:       input,
+		Reactive:    reactive,
+		BeforeCount: beforeCount,
+		AfterCount:  len(st.Messages),
+		Usage:       usage,
+	}
+	if err := s.Hooks.FireAfterSummary(ctx, e); err != nil {
+		return err
+	}
+	if e.ReplaceSummary != nil {
+		rs := *e.ReplaceSummary
+		if rs.Role == "" {
+			rs.Role = message.RoleUser
+		}
+		message.EnsureID(&rs)
+		if len(st.Messages) > 0 {
+			st.Messages[0] = rs
+		}
+	}
 	return nil
 }
 

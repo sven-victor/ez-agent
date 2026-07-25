@@ -65,6 +65,16 @@ func (h *Host) OnAfterRun(fn hook.Handler[hook.AfterRun]) {
 	h.Hooks.OnAfterRun(fn)
 }
 
+// OnBeforeSummary registers a before-summary hook.
+func (h *Host) OnBeforeSummary(fn hook.Handler[hook.BeforeSummary]) {
+	h.Hooks.OnBeforeSummary(fn)
+}
+
+// OnAfterSummary registers an after-summary hook.
+func (h *Host) OnAfterSummary(fn hook.Handler[hook.AfterSummary]) {
+	h.Hooks.OnAfterSummary(fn)
+}
+
 // InstallAll installs plugins; on failure returns an error and does not leave a partial host
 // for callers that discard the host (Agent.New builds fresh then installs).
 func InstallAll(h *Host, plugins []Plugin) error {

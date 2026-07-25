@@ -50,8 +50,8 @@ func TestCondenseOversizedParts(t *testing.T) {
 
 type failSum struct{}
 
-func (failSum) Summarize(context.Context, []message.Message) (message.Message, error) {
-	return message.Message{}, errors.New("boom")
+func (failSum) Summarize(context.Context, []message.Message) (message.Message, run.Usage, error) {
+	return message.Message{}, run.Usage{}, errors.New("boom")
 }
 
 func TestSummarizeReduceFallsBackWhenSummarizerFails(t *testing.T) {
@@ -140,7 +140,7 @@ func TestRobustSummarizerMapReduceOnOverflow(t *testing.T) {
 		message.NewUserText(strings.Repeat("bbbb ", 30)),
 		message.NewUserText(strings.Repeat("cccc ", 30)),
 	}
-	out, err := r.Summarize(context.Background(), msgs)
+	out, _, err := r.Summarize(context.Background(), msgs)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -163,7 +163,7 @@ func TestRobustSummarizerTruncateFallback(t *testing.T) {
 		ChunkBytes:     32,
 		MaxChunks:      3,
 	}
-	out, err := r.Summarize(context.Background(), []message.Message{
+	out, _, err := r.Summarize(context.Background(), []message.Message{
 		message.NewUserText(strings.Repeat("z", 200)),
 	})
 	if err != nil {
@@ -188,7 +188,7 @@ func TestRobustSummarizerRetryThrottled(t *testing.T) {
 		Provider: p,
 		Retry:    model.ExponentialBackoff{MaxAttempts: 3, Initial: 1},
 	}
-	out, err := r.Summarize(context.Background(), []message.Message{message.NewUserText("hi")})
+	out, _, err := r.Summarize(context.Background(), []message.Message{message.NewUserText("hi")})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -239,7 +239,7 @@ func TestSegmentedSummarizer(t *testing.T) {
 		},
 	}
 	s := &memory.SegmentedSummarizer{Provider: p, MaxTurns: 5}
-	out, err := s.Summarize(context.Background(), []message.Message{
+	out, _, err := s.Summarize(context.Background(), []message.Message{
 		message.NewUserText("hello"),
 		message.NewAssistantText("world"),
 		message.NewUserText("latest intent"),

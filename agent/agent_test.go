@@ -7,6 +7,7 @@ import (
 
 	"github.com/sven-victor/ez-agent/agent"
 	"github.com/sven-victor/ez-agent/event"
+	"github.com/sven-victor/ez-agent/hook"
 	"github.com/sven-victor/ez-agent/logger"
 	"github.com/sven-victor/ez-agent/memory"
 	"github.com/sven-victor/ez-agent/message"
@@ -140,5 +141,25 @@ func TestWithLoggerInjectsContextPolicy(t *testing.T) {
 	}
 	if ps, ok := pol.Summarizer.(*memory.ProviderSummarizer); !ok || ps.Logger == nil {
 		t.Fatal("expected SetLogger to fill ProviderSummarizer.Logger")
+	}
+}
+
+func TestNewInjectsHooksIntoContextPolicy(t *testing.T) {
+	h := hook.NewRegistry()
+	pol := &memory.Summarize{
+		Summarizer:           &memory.ProviderSummarizer{Provider: echoProvider{}},
+		KeepRecent:           2,
+		ProactiveMaxMessages: 100,
+	}
+	_, err := agent.New(
+		agent.WithProvider(echoProvider{}),
+		agent.WithContextPolicy(pol),
+		agent.WithHooks(h),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pol.Hooks != h {
+		t.Fatal("expected SetHooks to fill Summarize.Hooks")
 	}
 }

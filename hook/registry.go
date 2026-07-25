@@ -52,17 +52,47 @@ type AfterTool struct {
 	ReplaceResult *tool.Result
 }
 
+// BeforeSummary is fired before a context-window summarization attempt
+// (proactive Prepare or reactive overflow Reduce).
+type BeforeSummary struct {
+	State *run.State
+	// Input is the message slice about to be summarized (may include an intent note).
+	// Handlers may replace this slice.
+	Input []message.Message
+	// Reactive is true for overflow Reduce; false for proactive Prepare.
+	Reactive bool
+	// Skip aborts this summarization attempt (Prepare ignores; Reduce may fall back).
+	Skip bool
+}
+
+// AfterSummary is fired after a successful summarization has been applied to State.Messages.
+// State.Usage already includes Usage from this summarization attempt.
+type AfterSummary struct {
+	State       *run.State
+	Summary     message.Message
+	Input       []message.Message // messages that were summarized
+	Reactive    bool
+	BeforeCount int // len(State.Messages) before summarization
+	AfterCount  int // len(State.Messages) after summarization
+	// Usage is token consumption from summarizer model call(s) in this attempt.
+	Usage run.Usage
+	// ReplaceSummary, when set, replaces the summary message at Messages[0].
+	ReplaceSummary *message.Message
+}
+
 // Handler is a typed hook callback.
 type Handler[T any] func(ctx context.Context, e *T) error
 
 // Registry holds multi-subscriber hooks. Before fires in registration order; After in reverse.
 type Registry struct {
-	beforeRun   []Handler[BeforeRun]
-	afterRun    []Handler[AfterRun]
-	beforeModel []Handler[BeforeModel]
-	afterModel  []Handler[AfterModel]
-	beforeTool  []Handler[BeforeTool]
-	afterTool   []Handler[AfterTool]
+	beforeRun     []Handler[BeforeRun]
+	afterRun      []Handler[AfterRun]
+	beforeModel   []Handler[BeforeModel]
+	afterModel    []Handler[AfterModel]
+	beforeTool    []Handler[BeforeTool]
+	afterTool     []Handler[AfterTool]
+	beforeSummary []Handler[BeforeSummary]
+	afterSummary  []Handler[AfterSummary]
 }
 
 // NewRegistry creates an empty Registry.
@@ -78,6 +108,12 @@ func (r *Registry) OnBeforeModel(h Handler[BeforeModel]) {
 func (r *Registry) OnAfterModel(h Handler[AfterModel]) { r.afterModel = append(r.afterModel, h) }
 func (r *Registry) OnBeforeTool(h Handler[BeforeTool]) { r.beforeTool = append(r.beforeTool, h) }
 func (r *Registry) OnAfterTool(h Handler[AfterTool])   { r.afterTool = append(r.afterTool, h) }
+func (r *Registry) OnBeforeSummary(h Handler[BeforeSummary]) {
+	r.beforeSummary = append(r.beforeSummary, h)
+}
+func (r *Registry) OnAfterSummary(h Handler[AfterSummary]) {
+	r.afterSummary = append(r.afterSummary, h)
+}
 
 func fireForward[T any](ctx context.Context, handlers []Handler[T], e *T) error {
 	for _, h := range handlers {
@@ -115,6 +151,12 @@ func (r *Registry) FireBeforeTool(ctx context.Context, e *BeforeTool) error {
 }
 func (r *Registry) FireAfterTool(ctx context.Context, e *AfterTool) error {
 	return fireReverse(ctx, r.afterTool, e)
+}
+func (r *Registry) FireBeforeSummary(ctx context.Context, e *BeforeSummary) error {
+	return fireForward(ctx, r.beforeSummary, e)
+}
+func (r *Registry) FireAfterSummary(ctx context.Context, e *AfterSummary) error {
+	return fireReverse(ctx, r.afterSummary, e)
 }
 
 // ToolAdapter adapts Registry to tool.CallHooks for a given run state.
@@ -156,9 +198,11 @@ func (a *ToolAdapter) AfterTool(ctx context.Context, call tool.Call, result tool
 // HooksBase embeds empty no-op methods for selective override when using a single Hooks interface.
 type HooksBase struct{}
 
-func (HooksBase) BeforeRun(context.Context, *BeforeRun) error     { return nil }
-func (HooksBase) AfterRun(context.Context, *AfterRun) error       { return nil }
-func (HooksBase) BeforeModel(context.Context, *BeforeModel) error { return nil }
-func (HooksBase) AfterModel(context.Context, *AfterModel) error   { return nil }
-func (HooksBase) BeforeTool(context.Context, *BeforeTool) error   { return nil }
-func (HooksBase) AfterTool(context.Context, *AfterTool) error     { return nil }
+func (HooksBase) BeforeRun(context.Context, *BeforeRun) error         { return nil }
+func (HooksBase) AfterRun(context.Context, *AfterRun) error           { return nil }
+func (HooksBase) BeforeModel(context.Context, *BeforeModel) error     { return nil }
+func (HooksBase) AfterModel(context.Context, *AfterModel) error       { return nil }
+func (HooksBase) BeforeTool(context.Context, *BeforeTool) error       { return nil }
+func (HooksBase) AfterTool(context.Context, *AfterTool) error         { return nil }
+func (HooksBase) BeforeSummary(context.Context, *BeforeSummary) error { return nil }
+func (HooksBase) AfterSummary(context.Context, *AfterSummary) error   { return nil }

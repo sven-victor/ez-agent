@@ -8,6 +8,7 @@ import (
 	"github.com/sven-victor/ez-agent/logger"
 	"github.com/sven-victor/ez-agent/message"
 	"github.com/sven-victor/ez-agent/model"
+	"github.com/sven-victor/ez-agent/run"
 )
 
 // ProviderSummarizer uses a model.Provider directly (no Agent loop) to summarize.
@@ -19,9 +20,9 @@ type ProviderSummarizer struct {
 }
 
 // Summarize asks the provider to compress msgs into a single user message.
-func (p *ProviderSummarizer) Summarize(ctx context.Context, msgs []message.Message) (message.Message, error) {
+func (p *ProviderSummarizer) Summarize(ctx context.Context, msgs []message.Message) (message.Message, run.Usage, error) {
 	if p == nil || p.Provider == nil {
-		return message.Message{}, fmt.Errorf("provider summarizer: provider is required")
+		return message.Message{}, run.Usage{}, fmt.Errorf("provider summarizer: provider is required")
 	}
 	log := policyLog(p.Logger)
 	sys := p.System
@@ -39,18 +40,18 @@ func (p *ProviderSummarizer) Summarize(ctx context.Context, msgs []message.Messa
 	res, err := p.Provider.Complete(ctx, req)
 	if err != nil {
 		log.Error("provider summarizer failed", "err", err)
-		return message.Message{}, err
+		return message.Message{}, run.Usage{}, err
 	}
 	text := strings.TrimSpace(message.TextContent(res.Message))
 	if text == "" {
 		err := fmt.Errorf("provider summarizer: empty summary")
 		log.Error("provider summarizer failed", "err", err)
-		return message.Message{}, err
+		return message.Message{}, res.Usage, err
 	}
-	log.Info("provider summarizer ok", "messages", len(msgs), "summary_bytes", len(text))
+	log.Info("provider summarizer ok", "messages", len(msgs), "summary_bytes", len(text), "usage_total", res.Usage.TotalTokens)
 	return message.Message{
 		ID:    message.NewID(),
 		Role:  message.RoleUser,
 		Parts: []message.Part{message.Text{Text: "[Conversation summary]\n" + text}},
-	}, nil
+	}, res.Usage, nil
 }

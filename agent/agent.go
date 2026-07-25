@@ -47,20 +47,20 @@ type Agent struct {
 type Option func(*config) error
 
 type config struct {
-	provider     model.Provider
-	tools        []tool.Registration
-	hooks        *hook.Registry
-	plugins      []plugin.Plugin
-	policy       memory.ContextPolicy
-	limits       run.Limits
-	system       model.System
-	sessionID    string
-	sessionStore memory.SessionStore
-	outputSchema []byte
-	outputName   string
-	registries   []tool.Registry
-	executor     tool.Executor
-	retryPolicy  model.RetryPolicy
+	provider        model.Provider
+	tools           []tool.Registration
+	hooks           *hook.Registry
+	plugins         []plugin.Plugin
+	policy          memory.ContextPolicy
+	limits          run.Limits
+	system          model.System
+	sessionID       string
+	sessionStore    memory.SessionStore
+	outputSchema    []byte
+	outputName      string
+	registries      []tool.Registry
+	executor        tool.Executor
+	retryPolicy     model.RetryPolicy
 	interrupter     loop.Interrupter
 	toolChoice      tool.Choice
 	checkpointID    string
@@ -285,6 +285,7 @@ func New(opts ...Option) (*Agent, error) {
 		"checkpoint", a.checkpointID != "",
 	)
 	memory.SetLogger(a.policy, a.logger)
+	memory.SetHooks(a.policy, a.hooks)
 	a.rebuildLoop()
 	return a, nil
 }

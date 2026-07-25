@@ -10,6 +10,7 @@ import (
 	"github.com/sven-victor/ez-agent/logger"
 	"github.com/sven-victor/ez-agent/message"
 	"github.com/sven-victor/ez-agent/model"
+	"github.com/sven-victor/ez-agent/run"
 )
 
 const (
@@ -47,13 +48,13 @@ type RobustSummarizer struct {
 }
 
 // Summarize compresses msgs into a single user summary message.
-func (r *RobustSummarizer) Summarize(ctx context.Context, msgs []message.Message) (message.Message, error) {
+func (r *RobustSummarizer) Summarize(ctx context.Context, msgs []message.Message) (message.Message, run.Usage, error) {
 	if r == nil || r.Provider == nil {
-		return message.Message{}, fmt.Errorf("robust summarizer: provider is required")
+		return message.Message{}, run.Usage{}, fmt.Errorf("robust summarizer: provider is required")
 	}
 	log := policyLog(r.Logger)
 	if len(msgs) == 0 {
-		return message.Message{}, fmt.Errorf("robust summarizer: no messages")
+		return message.Message{}, run.Usage{}, fmt.Errorf("robust summarizer: no messages")
 	}
 
 	intent := ""
@@ -61,35 +62,43 @@ func (r *RobustSummarizer) Summarize(ctx context.Context, msgs []message.Message
 		intent = lastUserText(msgs, defaultIntentBytes)
 	}
 
+	var usage run.Usage
 	log.Debug("robust summarizer one-shot", "messages", len(msgs), "est_tokens", EstimateTokens(msgs))
-	if text, err := r.oneShot(ctx, msgs, intent); err == nil {
-		log.Info("robust summarizer one-shot ok", "messages", len(msgs))
-		return summaryMessage("[Conversation summary]\n" + text), nil
+	if text, u, err := r.oneShot(ctx, msgs, intent); err == nil {
+		usage.Add(u)
+		log.Info("robust summarizer one-shot ok", "messages", len(msgs), "usage_total", usage.TotalTokens)
+		return summaryMessage("[Conversation summary]\n" + text), usage, nil
 	} else if !shouldChunkSummarize(err) && EstimateTokens(msgs) <= r.maxInputTokens() {
+		usage.Add(u)
 		log.Warn("robust summarizer one-shot failed", "err", err)
 		// Permanent non-overflow failure on a small payload: still try truncate if allowed.
 		if !r.DisableTruncate {
 			log.Warn("robust summarizer using truncate fallback")
-			return r.truncateFallback(msgs), nil
+			return r.truncateFallback(msgs), usage, nil
 		}
-		return message.Message{}, err
+		return message.Message{}, usage, err
 	} else {
+		usage.Add(u)
 		log.Warn("robust summarizer one-shot overflow/chunk path", "err", err)
 	}
 
 	log.Info("robust summarizer map-reduce", "messages", len(msgs))
-	if text, err := r.mapReduce(ctx, msgs, intent); err == nil && strings.TrimSpace(text) != "" {
-		log.Info("robust summarizer map-reduce ok")
-		return summaryMessage("[Conversation summary]\n" + text), nil
+	if text, u, err := r.mapReduce(ctx, msgs, intent); err == nil && strings.TrimSpace(text) != "" {
+		usage.Add(u)
+		log.Info("robust summarizer map-reduce ok", "usage_total", usage.TotalTokens)
+		return summaryMessage("[Conversation summary]\n" + text), usage, nil
 	} else if err != nil {
+		usage.Add(u)
 		log.Warn("robust summarizer map-reduce failed", "err", err)
+	} else {
+		usage.Add(u)
 	}
 
 	if !r.DisableTruncate {
 		log.Warn("robust summarizer using truncate fallback after map-reduce")
-		return r.truncateFallback(msgs), nil
+		return r.truncateFallback(msgs), usage, nil
 	}
-	return message.Message{}, fmt.Errorf("robust summarizer: all strategies failed")
+	return message.Message{}, usage, fmt.Errorf("robust summarizer: all strategies failed")
 }
 
 func (r *RobustSummarizer) maxInputTokens() int {
@@ -134,24 +143,26 @@ func (r *RobustSummarizer) systemPrompt() string {
 	return "You summarize conversation history for an AI agent. Preserve key facts, decisions, tool outcomes, and open tasks. Be concise."
 }
 
-func (r *RobustSummarizer) oneShot(ctx context.Context, msgs []message.Message, intent string) (string, error) {
+func (r *RobustSummarizer) oneShot(ctx context.Context, msgs []message.Message, intent string) (string, run.Usage, error) {
 	if EstimateTokens(msgs) > r.maxInputTokens() {
-		return "", model.ErrOverflow
+		return "", run.Usage{}, model.ErrOverflow
 	}
 	return r.completeSummary(ctx, msgs, intent, "Please summarize this conversation.")
 }
 
-func (r *RobustSummarizer) mapReduce(ctx context.Context, msgs []message.Message, intent string) (string, error) {
+func (r *RobustSummarizer) mapReduce(ctx context.Context, msgs []message.Message, intent string) (string, run.Usage, error) {
 	log := policyLog(r.Logger)
 	batches := splitMessagesForSummary(msgs, r.chunkBytes(), r.maxChunks())
 	if len(batches) == 0 {
-		return "", fmt.Errorf("robust summarizer: empty batches")
+		return "", run.Usage{}, fmt.Errorf("robust summarizer: empty batches")
 	}
 	log.Debug("robust summarizer map-reduce batches", "batches", len(batches))
+	var usage run.Usage
 	var parts []string
 	for i, batch := range batches {
 		prompt := fmt.Sprintf("This is part %d/%d of a longer conversation. Summarize this part concisely.", i+1, len(batches))
-		text, err := r.completeSummary(ctx, batch, intent, prompt)
+		text, u, err := r.completeSummary(ctx, batch, intent, prompt)
+		usage.Add(u)
 		if err != nil || strings.TrimSpace(text) == "" {
 			log.Warn("robust summarizer part failed; using truncate snippet", "part", i+1, "of", len(batches), "err", err)
 			fallback := truncateUTF8ByBytes(flattenMessagesText(batch), 1800)
@@ -162,20 +173,21 @@ func (r *RobustSummarizer) mapReduce(ctx context.Context, msgs []message.Message
 	}
 	merged := strings.Join(parts, "\n\n--- part ---\n\n")
 	if len(merged) <= r.mergeThreshold() {
-		return merged, nil
+		return merged, usage, nil
 	}
 	log.Debug("robust summarizer merging partials", "bytes", len(merged))
 	mergeMsgs := []message.Message{message.NewUserText(
 		fmt.Sprintf("Merge these partial conversation summaries into one concise summary. Remove redundancy.\n\n%s", merged),
 	)}
-	text, err := r.completeSummary(ctx, mergeMsgs, intent, "")
+	text, u, err := r.completeSummary(ctx, mergeMsgs, intent, "")
+	usage.Add(u)
 	if err == nil && strings.TrimSpace(text) != "" {
-		return strings.TrimSpace(text), nil
+		return strings.TrimSpace(text), usage, nil
 	}
 	if err != nil {
 		log.Warn("robust summarizer merge failed; returning joined parts", "err", err)
 	}
-	return merged, nil
+	return merged, usage, nil
 }
 
 func (r *RobustSummarizer) truncateFallback(msgs []message.Message) message.Message {
@@ -184,7 +196,7 @@ func (r *RobustSummarizer) truncateFallback(msgs []message.Message) message.Mess
 	return summaryMessage("[Conversation summary — truncated]\n" + body + defaultCondenseNotice)
 }
 
-func (r *RobustSummarizer) completeSummary(ctx context.Context, msgs []message.Message, intent, userPrompt string) (string, error) {
+func (r *RobustSummarizer) completeSummary(ctx context.Context, msgs []message.Message, intent, userPrompt string) (string, run.Usage, error) {
 	reqMsgs := append([]message.Message(nil), msgs...)
 	if intent != "" {
 		reqMsgs = append([]message.Message{message.NewUserText(
@@ -206,9 +218,9 @@ func (r *RobustSummarizer) completeSummary(ctx context.Context, msgs []message.M
 		if err == nil {
 			text := strings.TrimSpace(message.TextContent(res.Message))
 			if text == "" {
-				return "", fmt.Errorf("robust summarizer: empty summary")
+				return "", res.Usage, fmt.Errorf("robust summarizer: empty summary")
 			}
-			return text, nil
+			return text, res.Usage, nil
 		}
 		lastErr = err
 		attempt++
@@ -218,12 +230,12 @@ func (r *RobustSummarizer) completeSummary(ctx context.Context, msgs []message.M
 		}
 		wait, ok := policy.ShouldRetry(attempt, err)
 		if !ok {
-			return "", lastErr
+			return "", run.Usage{}, lastErr
 		}
 		policyLog(r.Logger).Warn("robust summarizer retry", "attempt", attempt, "wait", wait, "err", err)
 		select {
 		case <-ctx.Done():
-			return "", ctx.Err()
+			return "", run.Usage{}, ctx.Err()
 		case <-time.After(wait):
 		}
 	}

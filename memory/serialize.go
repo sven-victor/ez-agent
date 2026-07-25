@@ -18,22 +18,22 @@ type wireMessage struct {
 }
 
 type wirePart struct {
-	Type      string          `json:"type"`
-	Text      string          `json:"text,omitempty"`
-	Detail    string          `json:"detail,omitempty"`
-	MIME      string          `json:"mime,omitempty"`
-	URL       string          `json:"url,omitempty"`
-	Path      string          `json:"path,omitempty"`
-	Filename  string          `json:"filename,omitempty"`
-	Size      int64           `json:"size,omitempty"`
-	BytesB64  string          `json:"bytes_b64,omitempty"`
-	ID        string          `json:"id,omitempty"`
-	Name      string          `json:"name,omitempty"`
-	Input     json.RawMessage `json:"input,omitempty"`
-	ToolUseID string          `json:"tool_use_id,omitempty"`
-	OK        *bool           `json:"ok,omitempty"`
-	Parts     []wirePart      `json:"parts,omitempty"`
-	Signature string          `json:"signature,omitempty"`
+	Type       string          `json:"type"`
+	Text       string          `json:"text,omitempty"`
+	Detail     string          `json:"detail,omitempty"`
+	MIME       string          `json:"mime,omitempty"`
+	URL        string          `json:"url,omitempty"`
+	Path       string          `json:"path,omitempty"`
+	Filename   string          `json:"filename,omitempty"`
+	Size       int64           `json:"size,omitempty"`
+	BytesB64   string          `json:"bytes_b64,omitempty"`
+	ID         string          `json:"id,omitempty"`
+	Name       string          `json:"name,omitempty"`
+	Input      json.RawMessage `json:"input,omitempty"`
+	ToolUseID  string          `json:"tool_use_id,omitempty"`
+	OK         *bool           `json:"ok,omitempty"`
+	Parts      []wirePart      `json:"parts,omitempty"`
+	Signature  string          `json:"signature,omitempty"`
 	DurationNs int64           `json:"duration_ns,omitempty"`
 }
 

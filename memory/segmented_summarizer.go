@@ -9,6 +9,7 @@ import (
 	"github.com/sven-victor/ez-agent/logger"
 	"github.com/sven-victor/ez-agent/message"
 	"github.com/sven-victor/ez-agent/model"
+	"github.com/sven-victor/ez-agent/run"
 	"github.com/sven-victor/ez-agent/tool"
 )
 
@@ -33,16 +34,16 @@ type SegmentedSummarizer struct {
 }
 
 // Summarize runs segmented summarization and returns a single user summary message.
-func (s *SegmentedSummarizer) Summarize(ctx context.Context, msgs []message.Message) (message.Message, error) {
+func (s *SegmentedSummarizer) Summarize(ctx context.Context, msgs []message.Message) (message.Message, run.Usage, error) {
 	if s == nil || s.Provider == nil {
-		return message.Message{}, fmt.Errorf("segmented summarizer: provider is required")
+		return message.Message{}, run.Usage{}, fmt.Errorf("segmented summarizer: provider is required")
 	}
 	log := policyLog(s.Logger)
 	if len(msgs) == 0 {
-		return message.Message{}, fmt.Errorf("segmented summarizer: no messages")
+		return message.Message{}, run.Usage{}, fmt.Errorf("segmented summarizer: no messages")
 	}
 	if !s.Provider.Caps().Tools {
-		return message.Message{}, fmt.Errorf("segmented summarizer: provider must support tools")
+		return message.Message{}, run.Usage{}, fmt.Errorf("segmented summarizer: provider must support tools")
 	}
 
 	store := newSummaryMessageStore(msgs)
@@ -66,6 +67,7 @@ func (s *SegmentedSummarizer) Summarize(ctx context.Context, msgs []message.Mess
 		maxTurns = defaultSegmentedMaxTurns
 	}
 
+	var usage run.Usage
 	log.Info("segmented summarizer started", "messages", len(msgs), "max_turns", maxTurns)
 	for turn := 0; turn < maxTurns; turn++ {
 		req := model.Request{
@@ -78,8 +80,9 @@ func (s *SegmentedSummarizer) Summarize(ctx context.Context, msgs []message.Mess
 		res, err := s.Provider.Complete(ctx, req)
 		if err != nil {
 			log.Error("segmented summarizer model failed", "turn", turn, "err", err)
-			return message.Message{}, fmt.Errorf("segmented summarizer: %w", err)
+			return message.Message{}, usage, fmt.Errorf("segmented summarizer: %w", err)
 		}
+		usage.Add(res.Usage)
 		hist = append(hist, res.Message)
 
 		uses := message.ToolUses(res.Message)
@@ -89,7 +92,7 @@ func (s *SegmentedSummarizer) Summarize(ctx context.Context, msgs []message.Mess
 			}
 			err := fmt.Errorf("segmented summarizer: model stopped without save_summary")
 			log.Error("segmented summarizer incomplete", "turn", turn, "err", err)
-			return message.Message{}, err
+			return message.Message{}, usage, err
 		}
 
 		calls := make([]tool.Call, len(uses))
@@ -100,7 +103,7 @@ func (s *SegmentedSummarizer) Summarize(ctx context.Context, msgs []message.Mess
 		results, err := exec.Execute(ctx, calls)
 		if err != nil {
 			log.Error("segmented summarizer tool failed", "turn", turn, "err", err)
-			return message.Message{}, err
+			return message.Message{}, usage, err
 		}
 		tr := make([]message.ToolResult, len(results))
 		for i, r := range results {
@@ -115,7 +118,7 @@ func (s *SegmentedSummarizer) Summarize(ctx context.Context, msgs []message.Mess
 		}
 		hist = append(hist, message.NewToolResultMessage(tr...))
 		if store.finished {
-			log.Info("segmented summarizer finished", "turns", turn+1, "summary_bytes", len(store.summary))
+			log.Info("segmented summarizer finished", "turns", turn+1, "summary_bytes", len(store.summary), "usage_total", usage.TotalTokens)
 			break
 		}
 	}
@@ -123,9 +126,9 @@ func (s *SegmentedSummarizer) Summarize(ctx context.Context, msgs []message.Mess
 	if !store.finished || strings.TrimSpace(store.summary) == "" {
 		err := fmt.Errorf("segmented summarizer: save_summary was not called")
 		log.Error("segmented summarizer failed", "err", err)
-		return message.Message{}, err
+		return message.Message{}, usage, err
 	}
-	return summaryMessage("[Conversation summary]\n" + store.summary), nil
+	return summaryMessage("[Conversation summary]\n" + store.summary), usage, nil
 }
 
 func (s *SegmentedSummarizer) buildSystem(store *summaryMessageStore) string {

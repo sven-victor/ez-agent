@@ -15,7 +15,7 @@ Inspired by [Strands Agents](https://strandsagents.com/) **behavior** (loop, too
 | Messages | Text, Image, Audio, Video, Document, AudioOut, Reasoning, Opaque, ToolUse, ToolResult |
 | Structured output | Native JSON Schema via `WithOutputSchema` (OpenAI `response_format`, Anthropic `output_config`, Gemini `responseSchema`) |
 | Streaming | `RunStream` yields typed `event.Event` values |
-| Hooks / Plugins | Before/After Run, Model, Tool; plugins register tools + hooks; `contrib/memoryplugin` |
+| Hooks / Plugins | Before/After Run, Model, Tool, Summary; plugins register tools + hooks; `contrib/memoryplugin` |
 | Logging | Optional `WithLogger` (`Debug`/`Info`/`Warn`/`Error`); `logger.FromSlog` for `log/slog` |
 | Limits | `MaxTurns`, `MaxTotalTokens`, `MaxOutputTokens`; cancel via `context` |
 | Memory | `Noop`, `Window`, `Summarize` (+ `RobustSummarizer`, `SegmentedSummarizer`), `Offload`, `DegradeMedia`; `SessionStore`; `LongTerm` |
@@ -437,6 +437,16 @@ h.OnAfterTool(func(ctx context.Context, e *hook.AfterTool) error {
     // e.ReplaceResult = &result
     return nil
 })
+h.OnBeforeSummary(func(ctx context.Context, e *hook.BeforeSummary) error {
+    // e.Skip = true  // abort this summarization attempt
+    // e.Input = ...  // replace summarizer input
+    return nil
+})
+h.OnAfterSummary(func(ctx context.Context, e *hook.AfterSummary) error {
+    // e.Usage — summarizer model tokens (also added to e.State.Usage)
+    // e.ReplaceSummary = &msg
+    return nil
+})
 
 agent.New(agent.WithProvider(p), agent.WithHooks(h))
 ```
@@ -444,7 +454,7 @@ agent.New(agent.WithProvider(p), agent.WithHooks(h))
 - **Before\***: registration order  
 - **After\***: reverse registration order (for symmetric cleanup)
 
-Events: `BeforeRun` / `AfterRun`, `BeforeModel` / `AfterModel`, `BeforeTool` / `AfterTool`.
+Events: `BeforeRun` / `AfterRun`, `BeforeModel` / `AfterModel`, `BeforeTool` / `AfterTool`, `BeforeSummary` / `AfterSummary` (fired by `memory.Summarize` on proactive Prepare / reactive Reduce).
 
 Plugins package tools + hooks:
 
