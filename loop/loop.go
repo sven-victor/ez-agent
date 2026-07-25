@@ -26,17 +26,17 @@ const (
 
 // Config holds loop dependencies.
 type Config struct {
-	Provider      model.Provider
-	Tools         tool.Registry
-	Executor      tool.Executor
-	Hooks         *hook.Registry
-	Policy        memory.ContextPolicy
-	Limits        run.Limits
-	System        model.System
-	MaxOverflow   int
-	MaxModelRetry int
-	OutputSchema  []byte
-	OutputName    string
+	Provider        model.Provider
+	Tools           tool.Registry
+	Executor        tool.Executor
+	Hooks           *hook.Registry
+	Policy          memory.ContextPolicy
+	Limits          run.Limits
+	System          model.System
+	MaxOverflow     int
+	MaxModelRetry   int
+	OutputSchema    []byte
+	OutputName      string
 	RetryPolicy     model.RetryPolicy
 	Interrupter     Interrupter
 	ToolChoice      tool.Choice
@@ -167,12 +167,6 @@ func (l *Loop) Run(ctx context.Context, st *run.State, emit EmitFunc) (res *run.
 			_ = emit(event.RunError{Err: err})
 			return nil, err
 		}
-		if err := l.cfg.Hooks.FireBeforeModel(ctx, &hook.BeforeModel{State: st}); err != nil {
-			log.Error("before-model hook failed", "err", err)
-			_ = emit(event.RunError{Err: err})
-			return nil, err
-		}
-
 		req := model.Request{
 			Messages:     append([]message.Message(nil), st.Messages...),
 			System:       l.cfg.System,
@@ -183,6 +177,11 @@ func (l *Loop) Run(ctx context.Context, st *run.State, emit EmitFunc) (res *run.
 		}
 		if l.cfg.Tools != nil {
 			req.Tools = l.cfg.Tools.Specs()
+		}
+		if err := l.cfg.Hooks.FireBeforeModel(ctx, &hook.BeforeModel{State: st, Request: req}); err != nil {
+			log.Error("before-model hook failed", "err", err)
+			_ = emit(event.RunError{Err: err})
+			return nil, err
 		}
 		if err := model.Validate(l.cfg.Provider, req); err != nil {
 			log.Error("model request invalid", "err", err)

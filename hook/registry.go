@@ -23,7 +23,8 @@ type AfterRun struct {
 
 // BeforeModel is fired before each model call.
 type BeforeModel struct {
-	State *run.State
+	State   *run.State
+	Request model.Request
 }
 
 // AfterModel is fired after each model call.
