@@ -21,6 +21,8 @@
 //	go run ./cmd/demo -mcp-stdio "npx -y @modelcontextprotocol/server-everything"
 //	go run ./cmd/demo -mcp-http http://localhost:8080/mcp
 //	go run ./cmd/demo -mcp-config mcp.json
+//	go run ./cmd/demo -a2a-url http://127.0.0.1:8080
+//	go run ./cmd/demo -a2a-serve :8080
 package main
 
 import (
@@ -70,6 +72,12 @@ func main() {
 		mcpCfg.SSE = append(mcpCfg.SSE, s)
 		return nil
 	})
+	var a2aCfg a2aConfig
+	flag.StringVar(&a2aCfg.Serve, "a2a-serve", "", "listen address to expose this agent as an A2A JSON-RPC server (e.g. :8080)")
+	flag.Func("a2a-url", "A2A Agent Card base URL (repeatable); remote skills become tools", func(s string) error {
+		a2aCfg.URLs = append(a2aCfg.URLs, s)
+		return nil
+	})
 	flag.Parse()
 
 	cfg := demoConfig{
@@ -86,6 +94,7 @@ func main() {
 		LogLevel:         *logLevel,
 		UI:               strings.ToLower(strings.TrimSpace(*uiMode)),
 		MCP:              mcpCfg,
+		A2A:              a2aCfg,
 	}
 	if err := realMain(cfg); err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
@@ -108,6 +117,7 @@ type demoConfig struct {
 	UI               string // terminal | tui
 	Logger           logger.Logger
 	MCP              mcpConfig
+	A2A              a2aConfig
 }
 
 func realMain(cfg demoConfig) error {
@@ -158,6 +168,15 @@ func realMain(cfg demoConfig) error {
 		defer mcp.Close()
 	}
 
+	var a2a *a2aBundle
+	if len(cfg.A2A.URLs) > 0 {
+		a2a, err = connectA2A(ctx, cfg.A2A)
+		if err != nil {
+			return err
+		}
+		defer a2a.Close()
+	}
+
 	interactive := strings.TrimSpace(cfg.Prompt) == ""
 	sid := cfg.SessionID
 	if sid == "" && interactive {
@@ -171,9 +190,20 @@ func realMain(cfg demoConfig) error {
 		cfg.Logger = newTUILogger(cfg.LogLevel, logCh)
 	}
 
-	a, toolNames, err := buildAgent(wd, pc, sid, cfg, mcp)
+	a, toolNames, err := buildAgent(wd, pc, sid, cfg, mcp, a2a)
 	if err != nil {
 		return err
+	}
+
+	if cfg.A2A.Serve != "" {
+		srv, err := serveA2A(ctx, cfg.A2A.Serve, a)
+		if err != nil {
+			return err
+		}
+		if a2a == nil {
+			a2a = &a2aBundle{}
+		}
+		a2a.server = srv
 	}
 
 	meta := sessionMeta{
@@ -185,7 +215,7 @@ func realMain(cfg demoConfig) error {
 	}
 
 	if !useTUI {
-		printBanner(pc, sid, mcp, cfg)
+		printBanner(pc, sid, mcp, a2a, cfg)
 	}
 
 	if interactive {
@@ -213,7 +243,7 @@ func mcpStatus(mcp *mcpBundle) string {
 	return fmt.Sprintf("ok (%d)", len(mcp.clients))
 }
 
-func printBanner(pc providerCase, sid string, mcp *mcpBundle, cfg demoConfig) {
+func printBanner(pc providerCase, sid string, mcp *mcpBundle, a2a *a2aBundle, cfg demoConfig) {
 	fmt.Printf("provider: %s\n", pc.name)
 	fmt.Printf("model:    %s\n", pc.model)
 	if sid != "" {
@@ -221,6 +251,12 @@ func printBanner(pc providerCase, sid string, mcp *mcpBundle, cfg demoConfig) {
 	}
 	if mcp != nil {
 		fmt.Printf("mcp:      %d server(s)\n", len(mcp.clients))
+	}
+	if a2a != nil && len(a2a.clients) > 0 {
+		fmt.Printf("a2a:      %d remote agent(s)\n", len(a2a.clients))
+	}
+	if cfg.A2A.Serve != "" {
+		fmt.Printf("a2a-serve: %s\n", cfg.A2A.Serve)
 	}
 	if cfg.MaxTurns == 0 {
 		fmt.Printf("max-turns: unlimited\n")
@@ -275,7 +311,7 @@ func resolveProvider(env livetest.Env, name, modelOverride string) (providerCase
 	}
 }
 
-func buildAgent(wd string, pc providerCase, sessionID string, cfg demoConfig, mcp *mcpBundle) (*agent.Agent, []string, error) {
+func buildAgent(wd string, pc providerCase, sessionID string, cfg demoConfig, mcp *mcpBundle, a2a *a2aBundle) (*agent.Agent, []string, error) {
 	system := `You are a helpful conversational assistant.
 Use tools when they help answer the user. Prefer built-in tools for time and random strings.
 Be concise unless the user asks for detail.`
@@ -300,6 +336,11 @@ Be concise unless the user asks for detail.`
 	}
 	if mcp != nil {
 		for _, c := range mcp.clients {
+			opts = append(opts, agent.WithToolRegistry(c.Registry()))
+		}
+	}
+	if a2a != nil {
+		for _, c := range a2a.clients {
 			opts = append(opts, agent.WithToolRegistry(c.Registry()))
 		}
 	}

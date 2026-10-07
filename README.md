@@ -12,6 +12,8 @@ Inspired by [Strands Agents](https://strandsagents.com/) **behavior** (loop, too
 | Provider | OpenAI-compatible, Anthropic Messages, Gemini (`model/openai`, `model/anthropic`, `model/gemini`); `Stream` + `Complete` |
 | Tools | Explicit `Spec` + `Handler`; concurrent or sequential; unknown tools become error results |
 | MCP | `tool/mcp` (stdio / HTTP / SSE / in-process); live `WithToolRegistry` + `RefreshTools` |
+| Sub-agents | `agent.AsTool` wraps a child `*Agent` as a parent tool (in-process) |
+| A2A | Optional module `github.com/sven-victor/ez-agent/a2a` (a2a-go JSON-RPC client/server) |
 | Messages | Text, Image, Audio, Video, Document, AudioOut, Reasoning, Opaque, ToolUse, ToolResult |
 | Structured output | Native JSON Schema via `WithOutputSchema` (OpenAI `response_format`, Anthropic `output_config`, Gemini `responseSchema`) |
 | Streaming | `RunStream` yields typed `event.Event` values |
@@ -31,6 +33,10 @@ go get github.com/sven-victor/ez-agent
 ```
 
 Requires Go 1.25+ (see `go.mod`).
+
+This repository is a **Go workspace** (`go.work`) with three modules: the core SDK, `a2a/`, and `cmd/demo`. Run `go test`, `go run ./cmd/demo`, and `go run ./a2a/examples/...` from the **repository root** so the workspace is picked up. `GOWORK=off` cannot resolve the unpublished `v0.0.0` module versions.
+
+A2A support is a separate module so SDK consumers do not depend on [a2a-go](https://github.com/a2aproject/a2a-go) unless they import `github.com/sven-victor/ez-agent/a2a`.
 
 ## Quick start
 
@@ -86,7 +92,7 @@ func main() {
 }
 ```
 
-Runnable demo (loads `.env` automatically; see `.env.example`):
+Runnable demo (from the repository root; loads `.env` automatically; see `.env.example`):
 
 ```bash
 cp .env.example .env   # then fill in API_KEY
@@ -103,6 +109,8 @@ go run ./cmd/demo -provider anthropic -session chat1
 go run ./cmd/demo -mcp-stdio "npx -y @modelcontextprotocol/server-everything"
 go run ./cmd/demo -mcp-http http://localhost:8080/mcp
 go run ./cmd/demo -mcp-config mcp.json   # mcpServers JSON (HTTP headers, stdio env, …)
+go run ./cmd/demo -a2a-url http://127.0.0.1:8080   # remote A2A skills as tools
+go run ./cmd/demo -a2a-serve :8080                  # expose this agent over A2A JSON-RPC
 ```
 
 Example `mcp.json` (FastMCP / Cursor canonical `mcpServers` format):
@@ -145,6 +153,7 @@ agent.Agent          # New / Run / RunStream / Resume / Continue / Checkpoint
           └── memory.ContextPolicy
 domain: message · event · run
 cross-cutting: plugin · realtime (not in Turn loop) · contrib/
+optional: a2a (separate module; Agent Card + JSON-RPC via a2a-go)
 ```
 
 Dependency direction: `agent` → `loop` → (`model`, `tool`) → (`message`, `event`, `run`). Vendor wire formats stay inside provider adapters; the loop never imports a vendor SDK.
@@ -359,6 +368,23 @@ Behavior:
 ```go
 agent.WithToolChoice(tool.Choice{Type: "named", Name: "search"})
 ```
+
+### Sub-agents (`agent.AsTool`)
+
+Wrap a child `*Agent` as a parent tool. The model decides when to call it from the tool `Description` + `{ "prompt": string }` schema. The child's transcript and session are **not** forwarded.
+
+```go
+child, _ := agent.New(agent.WithProvider(p), agent.WithSystem("You are a researcher."))
+parent, _ := agent.New(
+    agent.WithProvider(p),
+    agent.WithTools(agent.AsTool(child, agent.ToolMeta{
+        Name:        "researcher",
+        Description: "Use for literature review and fact finding.",
+    })),
+)
+```
+
+Nesting is capped (default 4; override with `agent.WithAsToolMaxDepth`). Prefer AsTool for in-process multi-agent; use A2A only across process or framework boundaries.
 
 ## Messages and media
 
@@ -621,11 +647,44 @@ _ = client.RefreshTools(ctx)
 
 `tool.Compose(regA, regB)` merges into a snapshot `MapRegistry` when you need a single static map.
 
+## A2A
+
+Agent-to-Agent protocol support lives in a **separate module** so the core SDK does not depend on [a2a-go](https://github.com/a2aproject/a2a-go). See [`a2a/README.md`](a2a/README.md).
+
+```go
+import eza2a "github.com/sven-victor/ez-agent/a2a"
+
+// Server: expose an Agent over JSON-RPC
+card := eza2a.NewJSONRPCCard("demo", "A demo agent", "http://127.0.0.1:8080/invoke")
+go eza2a.ListenAndServe(":8080", a, card)
+
+// Client: remote skills appear as tools on a parent Agent
+c, err := eza2a.Dial(ctx, "http://127.0.0.1:8080")
+parent, err := agent.New(agent.WithProvider(p), agent.WithToolRegistry(c.Registry()))
+```
+
+No-LLM examples:
+
+```bash
+go run ./a2a/examples/server -addr :8080
+go run ./a2a/examples/client -url http://127.0.0.1:8080 -prompt hello
+```
+
+Demo flags (run two processes; do not point `-a2a-url` at the same process that is serving):
+
+```bash
+go run ./cmd/demo -a2a-serve :8080
+go run ./cmd/demo -a2a-url http://127.0.0.1:8080
+```
+
+v1 is JSON-RPC + text. Streaming, gRPC, and HITL mapping are out of scope.
+
 ## Package layout
 
 ```text
 ez-agent/
-├── agent/           # New, Run, RunStream, Resume, Continue, Options
+├── go.work          # workspace: core + a2a + cmd/demo
+├── agent/           # New, Run, RunStream, Resume, Continue, AsTool, Options
 ├── loop/            # Turn state machine, HITL Interrupter
 ├── model/           # Provider, Capabilities, Validate, RetryPolicy
 │   ├── openai/      # Chat Completions SSE
@@ -643,7 +702,9 @@ ez-agent/
 │   └── openai/      # OpenAI Realtime WebSocket adapter
 ├── run/             # Input, State, Result, Limits, Usage
 ├── memory/          # ContextPolicy, Session, Offload, Checkpoint, LongTerm
-├── cmd/demo/          # Interactive chat demo (+ MCP, built-in tools)
+├── a2a/             # Separate module: A2A JSON-RPC client/server (a2a-go)
+│   └── examples/    # No-LLM server + client
+├── cmd/demo/        # Interactive chat demo (+ MCP, A2A flags, built-in tools)
 ├── internal/envfile   # Minimal .env loader
 └── internal/livetest  # Shared live credentials for demos/tests
 ```
@@ -674,8 +735,16 @@ Copy `.env.example` to get started. Live tests **Skip** when the required keys a
 ## Testing
 
 ```bash
-# Unit tests (mocks; no network)
+# From the repository root (go.work)
+
+# Core SDK unit tests
 go test ./...
+
+# A2A adapter (separate module)
+go test github.com/sven-victor/ez-agent/a2a
+
+# Demo package tests
+go test github.com/sven-victor/ez-agent/cmd/demo
 
 # Live provider + agent tests (need .env)
 go test ./model/openai/ ./model/anthropic/ ./agent/ -run Live -v
@@ -686,7 +755,7 @@ go run ./cmd/demo -prompt "What time is it?"
 
 Live coverage (per configured provider): streaming text, tool calls, multi-turn tool-result round-trips, max_tokens, cancel, agent tool loop, MaxTurns, parallel tools, session recall. OpenAI live also exercises JSON Schema when the gateway supports it.
 
-Unit coverage includes: plain text loop, tool round-trips, parallel tools, unknown tool pairing, incomplete tool sanitization, `MaxTurns` / `MaxTotalTokens` / `MaxOutputTokens`, multi-turn tool chains, window prepare/pair safety, overflow reduce+retry, cancel, hooks (lifecycle + deny), stream events, plugins, live tool-registry refresh, HITL interrupt/resume, checkpoints, and provider conform fixtures.
+Unit coverage includes: plain text loop, tool round-trips, parallel tools, unknown tool pairing, incomplete tool sanitization, `MaxTurns` / `MaxTotalTokens` / `MaxOutputTokens`, multi-turn tool chains, window prepare/pair safety, overflow reduce+retry, cancel, hooks (lifecycle + deny), stream events, plugins, live tool-registry refresh, HITL interrupt/resume, checkpoints, `agent.AsTool` nesting, A2A JSON-RPC round-trip, and provider conform fixtures.
 
 ## Design principles (short)
 

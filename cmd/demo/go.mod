@@ -8,7 +8,8 @@ require (
 	github.com/charmbracelet/bubbletea v1.3.10
 	github.com/charmbracelet/lipgloss v1.1.1-0.20250404203927-76690c660834
 	github.com/ergochat/readline v0.1.3
-	github.com/sven-victor/ez-agent v0.0.0-00010101-000000000000
+	github.com/sven-victor/ez-agent v0.0.0
+	github.com/sven-victor/ez-agent/a2a v0.0.0
 )
 
 require (
@@ -57,5 +58,3 @@ require (
 	golang.org/x/text v0.40.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
-
-replace github.com/sven-victor/ez-agent => ../..
