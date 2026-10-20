@@ -128,11 +128,16 @@ func (l *Loop) Run(ctx context.Context, st *run.State, emit EmitFunc) (res *run.
 		// HITL resume: run pending tools first, then continue to the model.
 		if st.Pending != nil && len(st.Pending.Calls) > 0 {
 			log.Info("resuming pending tools", "count", len(st.Pending.Calls), "turn", st.Turn)
-			if err := l.executePending(ctx, st, emit); err != nil {
+			ended, err := l.executePending(ctx, st, emit)
+			if err != nil {
 				_ = emit(event.RunError{Err: err})
 				return nil, err
 			}
 			st.Pending = nil
+			if ended {
+				res = l.finishEndOfChat(st, emit)
+				return res, nil
+			}
 			st.Turn++
 			continue
 		}
@@ -421,8 +426,13 @@ func (l *Loop) Run(ctx context.Context, st *run.State, emit EmitFunc) (res *run.
 			}
 		}
 
-		if err := l.runTools(ctx, st, emit, calls); err != nil {
+		ended, err := l.runTools(ctx, st, emit, calls)
+		if err != nil {
 			return nil, err
+		}
+		if ended {
+			res = l.finishEndOfChat(st, emit)
+			return res, nil
 		}
 		st.Turn++
 		l.saveCheckpoint(ctx, st)
@@ -472,7 +482,7 @@ func sameMessages(a, b []message.Message) bool {
 	return reflect.DeepEqual(a, b)
 }
 
-func (l *Loop) executePending(ctx context.Context, st *run.State, emit EmitFunc) error {
+func (l *Loop) executePending(ctx context.Context, st *run.State, emit EmitFunc) (bool, error) {
 	calls := make([]tool.Call, len(st.Pending.Calls))
 	for i, c := range st.Pending.Calls {
 		calls[i] = tool.Call{ID: c.ID, Name: c.Name, Input: c.Input}
@@ -480,7 +490,7 @@ func (l *Loop) executePending(ctx context.Context, st *run.State, emit EmitFunc)
 	return l.runTools(ctx, st, emit, calls)
 }
 
-func (l *Loop) runTools(ctx context.Context, st *run.State, emit EmitFunc, calls []tool.Call) error {
+func (l *Loop) runTools(ctx context.Context, st *run.State, emit EmitFunc, calls []tool.Call) (bool, error) {
 	log := l.cfg.Logger
 	exec := l.executor(st)
 	for _, call := range calls {
@@ -490,6 +500,25 @@ func (l *Loop) runTools(ctx context.Context, st *run.State, emit EmitFunc, calls
 	start := time.Now()
 	results, err := exec.Execute(ctx, calls)
 	elapsed := time.Since(start)
+	// End-of-chat is a result sentinel, not an Execute error. The batch has
+	// already run; do not append results or surface RunError.
+	if len(results) == len(calls) && hasEndOfChat(results) {
+		for i, call := range calls {
+			log.Info("tool finished",
+				"tool", call.Name,
+				"tool_use_id", call.ID,
+				"ok", results[i].OK,
+				"duration", elapsed,
+			)
+			_ = emit(event.ToolFinished{Call: call, Result: results[i]})
+		}
+		if derr := l.dropToolUses(ctx, st); derr != nil {
+			log.Error("drop tool uses failed", "err", derr)
+			_ = emit(event.RunError{Err: derr})
+			return false, derr
+		}
+		return true, nil
+	}
 	if err != nil {
 		log.Error("tool execution failed", "count", len(calls), "duration", elapsed, "err", err)
 		if len(results) == len(calls) {
@@ -500,13 +529,13 @@ func (l *Loop) runTools(ctx context.Context, st *run.State, emit EmitFunc, calls
 			if aerr := l.appendMessage(ctx, st, message.NewToolResultMessage(tool.ToMessageParts(results)...)); aerr != nil {
 				log.Error("append tool results failed", "err", aerr)
 				_ = emit(event.RunError{Err: aerr})
-				return aerr
+				return false, aerr
 			}
 		} else {
 			if aerr := l.appendMessage(ctx, st, syntheticErrorResults(calls, err)); aerr != nil {
 				log.Error("append synthetic tool errors failed", "err", aerr)
 				_ = emit(event.RunError{Err: aerr})
-				return aerr
+				return false, aerr
 			}
 		}
 		select {
@@ -514,11 +543,11 @@ func (l *Loop) runTools(ctx context.Context, st *run.State, emit EmitFunc, calls
 			log.Info("run canceled during tools", "err", ctx.Err())
 			_ = emit(event.Cancelled{})
 			_ = emit(event.RunFinished{Result: stop(st, run.StopCanceled)})
-			return ctx.Err()
+			return false, ctx.Err()
 		default:
 		}
 		_ = emit(event.RunError{Err: err})
-		return err
+		return false, err
 	}
 	for i, call := range calls {
 		log.Info("tool finished",
@@ -529,7 +558,53 @@ func (l *Loop) runTools(ctx context.Context, st *run.State, emit EmitFunc, calls
 		)
 		_ = emit(event.ToolFinished{Call: call, Result: results[i]})
 	}
-	return l.appendMessage(ctx, st, message.NewToolResultMessage(tool.ToMessageParts(results)...))
+	return false, l.appendMessage(ctx, st, message.NewToolResultMessage(tool.ToMessageParts(results)...))
+}
+
+func hasEndOfChat(results []tool.Result) bool {
+	for _, r := range results {
+		if errors.Is(r.Err, tool.ErrEndOfChat) {
+			return true
+		}
+	}
+	return false
+}
+
+// dropToolUses removes every ToolUse from the last assistant message.
+// An assistant message that becomes empty is popped. The session window is
+// replaced so a tool_use already appended to the store does not linger.
+func (l *Loop) dropToolUses(ctx context.Context, st *run.State) error {
+	if st != nil && len(st.Messages) > 0 {
+		last := st.Messages[len(st.Messages)-1]
+		if last.Role == message.RoleAssistant {
+			kept := make([]message.Part, 0, len(last.Parts))
+			for _, p := range last.Parts {
+				if _, ok := p.(message.ToolUse); ok {
+					continue
+				}
+				kept = append(kept, p)
+			}
+			if len(kept) == 0 {
+				st.PopLastMessage()
+			} else {
+				last.Parts = kept
+				st.ReplaceLastMessage(last)
+			}
+		}
+	}
+	msgs := []message.Message(nil)
+	if st != nil {
+		msgs = st.Messages
+	}
+	return l.sessionReplaceAll(ctx, msgs)
+}
+
+func (l *Loop) finishEndOfChat(st *run.State, emit EmitFunc) *run.Result {
+	st.Pending = nil
+	l.cfg.Logger.Info("run stopped by end of chat", "turn", st.Turn)
+	res := stop(st, run.StopEndOfChat)
+	_ = emit(event.RunFinished{Result: res})
+	return res
 }
 
 func pendingFromCalls(calls []tool.Call) *run.PendingTools {

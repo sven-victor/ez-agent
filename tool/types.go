@@ -3,9 +3,16 @@ package tool
 import (
 	"context"
 	"encoding/json"
+	"errors"
 
 	"github.com/sven-victor/ez-agent/message"
 )
+
+// ErrEndOfChat ends the agent loop after this tool's side effects have run.
+// Observers still receive ToolFinished. The batch is not written into history
+// and the model is not called again. Return it from the handler; optionally
+// set Result.Err to the same value. Detect it with errors.Is.
+var ErrEndOfChat = errors.New("end of chat")
 
 // Spec describes a tool for the model.
 type Spec struct {
@@ -29,6 +36,7 @@ type Call struct {
 
 // Result is the outcome of a tool call.
 // Handler business failure should set OK=false; framework errors are normalized the same way by the Executor.
+// ErrEndOfChat is not a business failure: OK and Content are kept, and a zero Result becomes OK=true.
 type Result struct {
 	ToolUseID string
 	OK        bool

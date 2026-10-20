@@ -177,3 +177,90 @@ func TestCancelFillsResults(t *testing.T) {
 		}
 	}
 }
+
+func TestEndOfChatKeepsHandlerResult(t *testing.T) {
+	reg := tool.NewRegistry(tool.Registration{
+		Spec: tool.Spec{Name: "bye", InputSchema: []byte(`{}`)},
+		Handler: func(ctx context.Context, call tool.Call) (tool.Result, error) {
+			return tool.Result{
+				ToolUseID: call.ID,
+				OK:        true,
+				Content:   []message.Part{message.Text{Text: "local note"}},
+				Err:       tool.ErrEndOfChat,
+			}, tool.ErrEndOfChat
+		},
+	})
+	results, err := (&tool.Sequential{Registry: reg}).Execute(context.Background(), []tool.Call{{ID: "c1", Name: "bye"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("results=%d", len(results))
+	}
+	got := results[0]
+	if !got.OK {
+		t.Fatal("expected OK=true")
+	}
+	if message.TextContent(message.Message{Parts: got.Content}) != "local note" {
+		t.Fatalf("content=%v", got.Content)
+	}
+	if !errors.Is(got.Err, tool.ErrEndOfChat) {
+		t.Fatalf("err=%v", got.Err)
+	}
+}
+
+func TestEndOfChatZeroResultDefaultsOK(t *testing.T) {
+	reg := tool.NewRegistry(tool.Registration{
+		Spec: tool.Spec{Name: "bye", InputSchema: []byte(`{}`)},
+		Handler: func(ctx context.Context, call tool.Call) (tool.Result, error) {
+			return tool.Result{}, tool.ErrEndOfChat
+		},
+	})
+	results, err := (&tool.Concurrent{Registry: reg}).Execute(context.Background(), []tool.Call{{ID: "c1", Name: "bye"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := results[0]
+	if got.ToolUseID != "c1" || !got.OK || len(got.Content) != 0 || !errors.Is(got.Err, tool.ErrEndOfChat) {
+		t.Fatalf("result=%+v", got)
+	}
+}
+
+type clearErrHooks struct{}
+
+func (clearErrHooks) BeforeTool(context.Context, tool.Call) (tool.BeforeAction, error) {
+	return tool.BeforeAction{}, nil
+}
+
+func (clearErrHooks) AfterTool(ctx context.Context, call tool.Call, result tool.Result) (tool.Result, error) {
+	result.Content = []message.Part{message.Text{Text: "from hook"}}
+	result.Err = nil
+	return result, nil
+}
+
+func TestEndOfChatRestoresErrAfterHook(t *testing.T) {
+	reg := tool.NewRegistry(tool.Registration{
+		Spec: tool.Spec{Name: "bye", InputSchema: []byte(`{}`)},
+		Handler: func(ctx context.Context, call tool.Call) (tool.Result, error) {
+			return tool.Result{
+				ToolUseID: call.ID,
+				OK:        true,
+				Content:   []message.Part{message.Text{Text: "local note"}},
+				Err:       tool.ErrEndOfChat,
+			}, tool.ErrEndOfChat
+		},
+	})
+	results, err := (&tool.Sequential{Registry: reg, Hooks: clearErrHooks{}}).Execute(
+		context.Background(), []tool.Call{{ID: "c1", Name: "bye"}},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := results[0]
+	if message.TextContent(message.Message{Parts: got.Content}) != "from hook" {
+		t.Fatalf("content=%v", got.Content)
+	}
+	if !errors.Is(got.Err, tool.ErrEndOfChat) {
+		t.Fatalf("hook cleared sentinel: %v", got.Err)
+	}
+}

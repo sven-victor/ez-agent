@@ -269,6 +269,7 @@ type Result struct {
 | StopReason | Meaning |
 |------------|---------|
 | `end_turn` | Model finished without pending tools |
+| `end_of_chat` | A tool returned `tool.ErrEndOfChat` after it ran. The run succeeds; that batch is not fed back to the model |
 | `max_turns` | Hit `Limits.MaxTurns` (checked at the start of each cycle) |
 | `max_tokens` | Hit `Limits.MaxTotalTokens`, or provider reported length / truncated generation |
 | `canceled` | `ctx` canceled |
@@ -278,7 +279,7 @@ type Result struct {
 
 Invariants:
 
-- Every `ToolUse` gets a matching `ToolResult` before the next model call (success, failure, deny, cancel, or incomplete sanitization).
+- Every `ToolUse` gets a matching `ToolResult` before the next model call (success, failure, deny, cancel, or incomplete sanitization). `end_of_chat` is the exception: the assistant tool uses are removed instead of writing results.
 - Incomplete / truncated tool JSON is **not** executed; on `max_tokens` with tool calls, all tool uses in that message are stripped and annotated.
 
 ### Resume, Continue, Checkpoint
@@ -321,7 +322,7 @@ Each run roughly follows:
 5. On context overflow → `ContextPolicy.Reduce` (must shrink) → retry (default cap 3)
 6. After every model attempt: `AfterModel` (success or failure; on failure `Err` is set). On success: sanitize incomplete tool calls, append assistant message; hooks may `Retry` / `ReplaceMessage` (ignored when `Err != nil`)
 7. If stop is not `tool_use` → finish
-8. Else optional HITL interrupt → else execute tools (`BeforeTool` / `AfterTool`), append results, `Turn++`, continue
+8. Else optional HITL interrupt → else execute tools (`BeforeTool` / `AfterTool`). If any result is `tool.ErrEndOfChat`, emit `ToolFinished`, drop the assistant tool uses, and finish with `end_of_chat` (no tool results in history, no further model call). Otherwise append results, `Turn++`, continue
 9. `AfterRun` → return `Result`
 
 Cancel: in-flight tools exit ASAP; unpaired tool uses get synthetic error results so history stays consistent.
@@ -342,6 +343,8 @@ tool.Registration{
     Handler: func(ctx context.Context, call tool.Call) (tool.Result, error) {
         // Business failure: OK=false, continue the loop
         // Framework error (returned error): also normalized to OK=false so pairing holds
+        // End the chat: return tool.ErrEndOfChat (and set Result.Err to the same value).
+        // OK and Content are kept for observers; a zero Result is treated as OK=true.
         return tool.Result{
             ToolUseID: call.ID,
             OK:        true,
@@ -357,6 +360,7 @@ Behavior:
 - Unknown tool name → `OK=false` result, other tools still run
 - `BeforeTool` may `Deny` / `Skip` / `ReplaceInput`; deny/skip still produce a `ToolResult`
 - `AfterTool` runs whenever `BeforeTool` does **not** return an error (including handler failure, unknown tool, cancel, deny/skip); it may `ReplaceResult`. If `BeforeTool` itself fails, `AfterTool` is skipped.
+- `tool.ErrEndOfChat` ends the run after the whole batch finishes (`run.StopEndOfChat`). `ToolFinished` keeps the handler content (hooks may replace it). Results from that batch are not written to history, and the model is not called again.
 
 ### Live Multi vs snapshot Compose
 

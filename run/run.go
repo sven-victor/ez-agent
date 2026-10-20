@@ -7,7 +7,8 @@ type StopReason string
 
 const (
 	StopEndTurn     StopReason = "end_turn"
-	StopToolUse     StopReason = "tool_use" // intermediate only; never final Result
+	StopEndOfChat   StopReason = "end_of_chat" // tool ended the chat after it ran
+	StopToolUse     StopReason = "tool_use"    // intermediate only; never final Result
 	StopMaxTurns    StopReason = "max_turns"
 	StopMaxTokens   StopReason = "max_tokens"
 	StopCanceled    StopReason = "canceled"

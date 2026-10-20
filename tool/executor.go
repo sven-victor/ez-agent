@@ -2,6 +2,7 @@ package tool
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 
@@ -99,12 +100,50 @@ func runOne(ctx context.Context, reg Registry, hooks CallHooks, call Call) Resul
 	}
 
 	res, err := h(ctx, call)
+	// A real handler error still becomes OK=false. ErrEndOfChat keeps the
+	// handler result so the loop can see the sentinel on Result.Err.
+	if signal := endOfChatSignal(err, res.Err); signal != nil {
+		res = prepareEndOfChat(call, res, signal)
+		res = after(res)
+		if !errors.Is(res.Err, ErrEndOfChat) {
+			res.Err = signal
+		}
+		return res
+	}
 	if err != nil {
 		res = errorResult(call, err)
 	} else if res.ToolUseID == "" {
 		res.ToolUseID = call.ID
 	}
 	return after(res)
+}
+
+// endOfChatSignal returns the handler's end-of-chat error, if any.
+// A different non-nil handler error is a real failure and yields no signal.
+func endOfChatSignal(err, resErr error) error {
+	if err != nil && !errors.Is(err, ErrEndOfChat) {
+		return nil
+	}
+	if errors.Is(err, ErrEndOfChat) {
+		return err
+	}
+	if errors.Is(resErr, ErrEndOfChat) {
+		return resErr
+	}
+	return nil
+}
+
+// prepareEndOfChat keeps handler OK and Content. A zero Result gets the call
+// id, OK=true, and empty Content. Err is the sentinel the loop scans for.
+func prepareEndOfChat(call Call, res Result, signal error) Result {
+	if res.ToolUseID == "" && !res.OK && len(res.Content) == 0 && res.Err == nil {
+		return Result{ToolUseID: call.ID, OK: true, Err: signal}
+	}
+	if res.ToolUseID == "" {
+		res.ToolUseID = call.ID
+	}
+	res.Err = signal
+	return res
 }
 
 func errorResult(call Call, err error) Result {
