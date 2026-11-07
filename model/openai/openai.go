@@ -322,13 +322,14 @@ func encodeToolChoice(c tool.Choice) any {
 
 func encodeMessages(req model.Request) ([]wireMessage, error) {
 	var out []wireMessage
-	if req.System.Text != "" || len(req.System.Parts) > 0 {
-		content, err := encodeUserContent(append([]message.Part{message.Text{Text: req.System.Text}}, req.System.Parts...))
+	sysParts := message.WithoutCacheBreakpoints(req.System.Parts)
+	if req.System.Text != "" || len(sysParts) > 0 {
+		content, err := encodeUserContent(append([]message.Part{message.Text{Text: req.System.Text}}, sysParts...))
 		if err != nil {
 			return nil, err
 		}
 		// System is text-only on OpenAI chat completions in the common case.
-		if req.System.Text != "" && len(req.System.Parts) == 0 {
+		if req.System.Text != "" && len(sysParts) == 0 {
 			out = append(out, wireMessage{Role: "system", Content: req.System.Text})
 		} else {
 			out = append(out, wireMessage{Role: "system", Content: content})
@@ -336,8 +337,13 @@ func encodeMessages(req model.Request) ([]wireMessage, error) {
 	}
 
 	for _, m := range req.Messages {
+		parts := message.WithoutCacheBreakpoints(m.Parts)
 		switch m.Role {
 		case message.RoleAssistant:
+			if len(parts) == 0 && len(m.Parts) > 0 {
+				continue
+			}
+			m.Parts = parts
 			wm, err := encodeAssistant(m)
 			if err != nil {
 				return nil, err
@@ -347,7 +353,7 @@ func encodeMessages(req model.Request) ([]wireMessage, error) {
 			// Tool results become role=tool messages.
 			var toolResults []message.ToolResult
 			var other []message.Part
-			for _, p := range m.Parts {
+			for _, p := range parts {
 				if tr, ok := p.(message.ToolResult); ok {
 					toolResults = append(toolResults, tr)
 				} else {

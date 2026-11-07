@@ -19,6 +19,9 @@ type Spec struct {
 	Name        string
 	Description string
 	InputSchema json.RawMessage
+	// CacheBreakpoint asks the Anthropic adapter to set cache_control on this tool.
+	// The breakpoint covers this tool and every block before it. Other providers ignore it.
+	CacheBreakpoint bool
 }
 
 // Choice controls tool selection for model calls.

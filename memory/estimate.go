@@ -40,6 +40,8 @@ func estimatePartBytes(p message.Part) int {
 		return n
 	case message.Opaque:
 		return len(v.Data) + len(v.Vendor)
+	case message.CacheBreakpoint:
+		return 0
 	case message.Image:
 		return blobBytes(v.Blob)
 	case message.Audio:

@@ -2,6 +2,7 @@ package gemini_test
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -11,6 +12,7 @@ import (
 	"github.com/sven-victor/ez-agent/model"
 	"github.com/sven-victor/ez-agent/model/gemini"
 	"github.com/sven-victor/ez-agent/run"
+	"github.com/sven-victor/ez-agent/tool"
 )
 
 func TestGeminiStreamText(t *testing.T) {
@@ -98,6 +100,45 @@ func TestGeminiWithHeader(t *testing.T) {
 	}
 	if gotCustom != "v1" {
 		t.Fatalf("X-Custom=%q", gotCustom)
+	}
+}
+
+func TestGeminiIgnoresCacheBreakpoint(t *testing.T) {
+	var got map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&got)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"candidates":[{"content":{"parts":[{"text":"ok"}]},"finishReason":"STOP"}]}`))
+	}))
+	defer srv.Close()
+
+	p := gemini.New(gemini.WithBaseURL(srv.URL), gemini.WithAPIKey("k"), gemini.WithHTTPClient(srv.Client()))
+	_, err := p.Complete(context.Background(), model.Request{
+		System: model.System{Text: "rules", Parts: []message.Part{message.CacheBreakpoint{}}},
+		Tools:  []tool.Spec{{Name: "echo", Description: "echo", InputSchema: json.RawMessage(`{"type":"object"}`), CacheBreakpoint: true}},
+		Messages: []message.Message{{
+			Role: message.RoleUser,
+			Parts: []message.Part{
+				message.Text{Text: "hi"},
+				message.CacheBreakpoint{},
+			},
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := json.Marshal(got)
+	if strings.Contains(string(raw), "cache_control") || strings.Contains(string(raw), "cache_breakpoint") {
+		t.Fatalf("body=%s", raw)
+	}
+	sys := got["systemInstruction"].(map[string]any)["parts"].([]any)
+	if sys[0].(map[string]any)["text"] != "rules" || len(sys) != 1 {
+		t.Fatalf("system=%v", sys)
+	}
+	contents := got["contents"].([]any)
+	parts := contents[0].(map[string]any)["parts"].([]any)
+	if parts[0].(map[string]any)["text"] != "hi" || len(parts) != 1 {
+		t.Fatalf("contents=%v", contents)
 	}
 }
 

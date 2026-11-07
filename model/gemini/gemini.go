@@ -180,6 +180,7 @@ func encodeRequest(req model.Request) ([]byte, error) {
 				}
 			}
 		}
+		m.Parts = message.WithoutCacheBreakpoints(m.Parts)
 		parts, err := encodeParts(m, lastToolNames)
 		if err != nil {
 			return nil, err
@@ -190,12 +191,13 @@ func encodeRequest(req model.Request) ([]byte, error) {
 		contents = append(contents, content{Role: role, Parts: parts})
 	}
 	gr := genRequest{Contents: contents}
-	if req.System.Text != "" || len(req.System.Parts) > 0 {
+	sysSrc := message.WithoutCacheBreakpoints(req.System.Parts)
+	if req.System.Text != "" || len(sysSrc) > 0 {
 		sysParts := []any{}
 		if req.System.Text != "" {
 			sysParts = append(sysParts, map[string]any{"text": req.System.Text})
 		}
-		for _, p := range req.System.Parts {
+		for _, p := range sysSrc {
 			encoded, err := encodeOnePart(p, nil)
 			if err != nil {
 				return nil, err

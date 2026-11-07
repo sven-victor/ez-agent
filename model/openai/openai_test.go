@@ -198,6 +198,45 @@ func TestOpenAIOrganizationAndHeaders(t *testing.T) {
 	}
 }
 
+func TestOpenAIIgnoresCacheBreakpoint(t *testing.T) {
+	var got map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&got)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`))
+	}))
+	defer srv.Close()
+
+	p := openai.New(openai.WithBaseURL(srv.URL), openai.WithAPIKey("test"), openai.WithHTTPClient(srv.Client()))
+	_, err := p.Complete(context.Background(), model.Request{
+		System: model.System{Text: "rules", Parts: []message.Part{message.CacheBreakpoint{}}},
+		Tools:  []tool.Spec{{Name: "echo", Description: "echo", InputSchema: json.RawMessage(`{"type":"object"}`), CacheBreakpoint: true}},
+		Messages: []message.Message{{
+			Role: message.RoleUser,
+			Parts: []message.Part{
+				message.Text{Text: "hi"},
+				message.CacheBreakpoint{},
+			},
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := json.Marshal(got)
+	if strings.Contains(string(raw), "cache_control") || strings.Contains(string(raw), "cache_breakpoint") {
+		t.Fatalf("body=%s", raw)
+	}
+	msgs := got["messages"].([]any)
+	sys := msgs[0].(map[string]any)
+	if sys["role"] != "system" || sys["content"] != "rules" {
+		t.Fatalf("system=%v", sys)
+	}
+	user := msgs[1].(map[string]any)
+	if user["content"] != "hi" {
+		t.Fatalf("user=%v", user)
+	}
+}
+
 func TestOpenAIUsageCache(t *testing.T) {
 	const body = `{"choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":100,"completion_tokens":20,"total_tokens":999,"prompt_tokens_details":{"cached_tokens":80}}}`
 	want := run.NewUsage(100, 20, 80, 0)

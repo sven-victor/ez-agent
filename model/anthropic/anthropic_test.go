@@ -3,12 +3,14 @@ package anthropic_test
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 
 	"github.com/sven-victor/ez-agent/event"
+	"github.com/sven-victor/ez-agent/logger"
 	"github.com/sven-victor/ez-agent/message"
 	"github.com/sven-victor/ez-agent/model"
 	"github.com/sven-victor/ez-agent/model/anthropic"
@@ -166,6 +168,128 @@ func TestAnthropicWithHeader(t *testing.T) {
 	if gotKey != "override" {
 		t.Fatalf("x-api-key=%q", gotKey)
 	}
+}
+
+func TestAnthropicCacheBreakpoints(t *testing.T) {
+	var got map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&got)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`))
+	}))
+	defer srv.Close()
+
+	p := anthropic.New(anthropic.WithBaseURL(srv.URL), anthropic.WithAPIKey("test"), anthropic.WithHTTPClient(srv.Client()))
+	_, err := p.Complete(context.Background(), model.Request{
+		System: model.System{
+			Text:  "stable rules",
+			Parts: []message.Part{message.CacheBreakpoint{}},
+		},
+		Tools: []tool.Spec{
+			{Name: "first", Description: "a", InputSchema: json.RawMessage(`{"type":"object"}`)},
+			{Name: "second", Description: "b", InputSchema: json.RawMessage(`{"type":"object"}`), CacheBreakpoint: true},
+		},
+		Messages: []message.Message{
+			{Role: message.RoleUser, Parts: []message.Part{
+				message.Text{Text: "cached doc"},
+				message.CacheBreakpoint{},
+			}},
+			message.NewUserText("new question"),
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	system, _ := got["system"].([]any)
+	if len(system) != 1 || cacheType(system[0]) != "ephemeral" || system[0].(map[string]any)["text"] != "stable rules" {
+		t.Fatalf("system=%v", got["system"])
+	}
+	tools, _ := got["tools"].([]any)
+	if len(tools) != 2 || cacheType(tools[0]) != "" || cacheType(tools[1]) != "ephemeral" {
+		t.Fatalf("tools=%v", got["tools"])
+	}
+	msgs, _ := got["messages"].([]any)
+	if len(msgs) != 2 {
+		t.Fatalf("messages=%v", got["messages"])
+	}
+	first := msgs[0].(map[string]any)["content"].([]any)
+	second := msgs[1].(map[string]any)["content"].([]any)
+	if cacheType(first[0]) != "ephemeral" || first[0].(map[string]any)["text"] != "cached doc" {
+		t.Fatalf("first=%v", first)
+	}
+	if cacheType(second[0]) != "" || second[0].(map[string]any)["text"] != "new question" {
+		t.Fatalf("second=%v", second)
+	}
+}
+
+func TestAnthropicCacheBreakpointErrors(t *testing.T) {
+	p := anthropic.New(anthropic.WithAPIKey("test"))
+	_, err := p.Complete(context.Background(), model.Request{
+		Messages: []message.Message{
+			{Role: message.RoleUser, Parts: []message.Part{message.CacheBreakpoint{}}},
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "no preceding block") {
+		t.Fatalf("err=%v", err)
+	}
+
+}
+
+func TestAnthropicCacheBreakpointKeepsFirstFour(t *testing.T) {
+	var got map[string]any
+	var warns []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&got)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`))
+	}))
+	defer srv.Close()
+
+	log := logger.Func{WarnFunc: func(msg string, args ...any) {
+		warns = append(warns, fmt.Sprint(append([]any{msg}, args...)))
+	}}
+	p := anthropic.New(
+		anthropic.WithBaseURL(srv.URL),
+		anthropic.WithAPIKey("test"),
+		anthropic.WithHTTPClient(srv.Client()),
+		anthropic.WithLogger(log),
+	)
+	var parts []message.Part
+	for i := 0; i < 5; i++ {
+		parts = append(parts,
+			message.Text{Text: fmt.Sprintf("block-%d", i)},
+			message.CacheBreakpoint{},
+		)
+	}
+	_, err := p.Complete(context.Background(), model.Request{
+		Messages: []message.Message{{Role: message.RoleUser, Parts: parts}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := got["messages"].([]any)[0].(map[string]any)["content"].([]any)
+	if len(content) != 5 {
+		t.Fatalf("content=%v", content)
+	}
+	for i := 0; i < 4; i++ {
+		if cacheType(content[i]) != "ephemeral" {
+			t.Fatalf("block %d cache=%q content=%v", i, cacheType(content[i]), content)
+		}
+	}
+	if cacheType(content[4]) != "" {
+		t.Fatalf("fifth block should be unmarked: %v", content[4])
+	}
+	if len(warns) != 1 || !strings.Contains(warns[0], "kept") || !strings.Contains(warns[0], "1") {
+		t.Fatalf("warns=%v", warns)
+	}
+}
+
+func cacheType(block any) string {
+	m, _ := block.(map[string]any)
+	cc, _ := m["cache_control"].(map[string]any)
+	typ, _ := cc["type"].(string)
+	return typ
 }
 
 func TestAnthropicUsageCache(t *testing.T) {

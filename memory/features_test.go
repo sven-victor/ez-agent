@@ -403,6 +403,29 @@ func TestCheckpointRoundTrip(t *testing.T) {
 	_ = filepath.Join(dir, "r1.ckpt.json")
 }
 
+func TestCacheBreakpointSerialize(t *testing.T) {
+	ctx := context.Background()
+	st := &run.State{}
+	st.InitHistory([]message.Message{{
+		Role: message.RoleUser,
+		Parts: []message.Part{
+			message.Text{Text: "stable"},
+			message.CacheBreakpoint{},
+		},
+	}})
+	fs := &memory.FileCheckpointStore{Dir: t.TempDir()}
+	if err := fs.Save(ctx, "bp", st); err != nil {
+		t.Fatal(err)
+	}
+	got, err := fs.Load(ctx, "bp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := got.Messages[0].Parts[1].(message.CacheBreakpoint); !ok {
+		t.Fatalf("parts=%#v", got.Messages[0].Parts)
+	}
+}
+
 func TestOpaqueSerialize(t *testing.T) {
 	ctx := context.Background()
 	st := &run.State{}

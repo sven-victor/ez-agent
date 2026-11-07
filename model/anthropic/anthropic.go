@@ -8,11 +8,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"os"
 	"strings"
 
 	"github.com/sven-victor/ez-agent/event"
+	"github.com/sven-victor/ez-agent/logger"
 	"github.com/sven-victor/ez-agent/message"
 	"github.com/sven-victor/ez-agent/model"
 	"github.com/sven-victor/ez-agent/run"
@@ -33,6 +35,7 @@ type Provider struct {
 	httpClient *http.Client
 	caps       model.Capabilities
 	headers    map[string]string // extra HTTP headers (applied after built-ins)
+	log        logger.Logger
 }
 
 // Option configures the provider.
@@ -73,12 +76,18 @@ func WithCaps(c model.Capabilities) Option {
 	return func(p *Provider) { p.caps = c }
 }
 
+// WithLogger sets the diagnostic logger. Nil discards logs.
+func WithLogger(l logger.Logger) Option {
+	return func(p *Provider) { p.log = l }
+}
+
 // New creates an Anthropic Messages provider.
 func New(opts ...Option) *Provider {
 	p := &Provider{
 		baseURL:    defaultBaseURL,
 		model:      "claude-sonnet-4-20250514",
 		httpClient: http.DefaultClient,
+		log:        logger.FromSlog(slog.Default()),
 		caps: model.Capabilities{
 			TextIn:      true,
 			ImageIn:     true,
@@ -93,6 +102,9 @@ func New(opts ...Option) *Provider {
 	}
 	for _, o := range opts {
 		o(p)
+	}
+	if p.log == nil {
+		p.log = logger.Nop()
 	}
 	return p
 }
@@ -128,7 +140,7 @@ func (p *Provider) doMessages(ctx context.Context, req model.Request, stream boo
 	if err := model.Validate(p, req); err != nil {
 		return nil, nil, err
 	}
-	body, err := encodeRequest(p.model, req, stream)
+	body, err := encodeRequest(p.model, req, stream, p.log)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -199,27 +211,86 @@ type wireMessage struct {
 }
 
 type wireTool struct {
-	Name        string          `json:"name"`
-	Description string          `json:"description,omitempty"`
-	InputSchema json.RawMessage `json:"input_schema"`
+	Name         string          `json:"name"`
+	Description  string          `json:"description,omitempty"`
+	InputSchema  json.RawMessage `json:"input_schema"`
+	CacheControl *cacheControl   `json:"cache_control,omitempty"`
 }
 
-func encodeRequest(modelName string, req model.Request, stream bool) ([]byte, error) {
-	msgs, err := encodeMessages(req.Messages)
-	if err != nil {
-		return nil, err
+type cacheControl struct {
+	Type string `json:"type"`
+}
+
+const maxCacheBreakpoints = 4
+
+// cacheCursor walks system, tools, then messages. A breakpoint marks the latest block.
+// Anthropic accepts at most 4 cache_control breakpoints. Extra markers are dropped.
+type cacheCursor struct {
+	n        int
+	dropped  int
+	block    map[string]any
+	tools    *[]wireTool
+	toolIdx  int
+	hasBlock bool
+	hasTool  bool
+}
+
+func (c *cacheCursor) noteBlock(b map[string]any) {
+	if b == nil {
+		return
 	}
+	c.block = b
+	c.hasBlock = true
+	c.hasTool = false
+}
+
+func (c *cacheCursor) noteTool(tools *[]wireTool, idx int) {
+	c.tools = tools
+	c.toolIdx = idx
+	c.hasTool = true
+	c.hasBlock = false
+}
+
+func (c *cacheCursor) breakpoint() error {
+	if c.n >= maxCacheBreakpoints {
+		c.dropped++
+		return nil
+	}
+	switch {
+	case c.hasBlock:
+		c.block["cache_control"] = map[string]any{"type": "ephemeral"}
+	case c.hasTool:
+		(*c.tools)[c.toolIdx].CacheControl = &cacheControl{Type: "ephemeral"}
+	default:
+		return fmt.Errorf("anthropic: cache breakpoint has no preceding block")
+	}
+	c.n++
+	return nil
+}
+
+func (c *cacheCursor) warnTruncation(log logger.Logger) {
+	if c.dropped == 0 {
+		return
+	}
+	logger.OrNop(log).Warn("anthropic cache breakpoints exceed limit; kept the first ones",
+		"kept", c.n,
+		"dropped", c.dropped,
+		"limit", maxCacheBreakpoints,
+	)
+}
+
+func encodeRequest(modelName string, req model.Request, stream bool, log logger.Logger) ([]byte, error) {
 	maxTok := req.MaxTokens
 	if maxTok <= 0 {
 		maxTok = defaultMaxTok
 	}
+	cur := &cacheCursor{}
 	ar := apiRequest{
 		Model:     modelName,
 		MaxTokens: maxTok,
-		Messages:  msgs,
 		Stream:    stream,
 	}
-	if sys, err := encodeSystem(req.System); err != nil {
+	if sys, err := encodeSystem(req.System, cur); err != nil {
 		return nil, err
 	} else if sys != nil {
 		ar.System = sys
@@ -234,7 +305,18 @@ func encodeRequest(modelName string, req model.Request, stream bool) ([]byte, er
 			Description: t.Description,
 			InputSchema: schema,
 		})
+		cur.noteTool(&ar.Tools, len(ar.Tools)-1)
+		if t.CacheBreakpoint {
+			if err := cur.breakpoint(); err != nil {
+				return nil, err
+			}
+		}
 	}
+	msgs, err := encodeMessages(req.Messages, cur)
+	if err != nil {
+		return nil, err
+	}
+	ar.Messages = msgs
 	if tc := encodeToolChoice(req.ToolChoice); tc != nil {
 		ar.ToolChoice = tc
 	}
@@ -250,6 +332,7 @@ func encodeRequest(modelName string, req model.Request, stream bool) ([]byte, er
 			},
 		}
 	}
+	cur.warnTruncation(log)
 	return json.Marshal(ar)
 }
 
@@ -271,7 +354,7 @@ func encodeToolChoice(c tool.Choice) any {
 	}
 }
 
-func encodeSystem(sys model.System) (any, error) {
+func encodeSystem(sys model.System, cur *cacheCursor) (any, error) {
 	if sys.Text == "" && len(sys.Parts) == 0 {
 		return nil, nil
 	}
@@ -280,32 +363,47 @@ func encodeSystem(sys model.System) (any, error) {
 	}
 	blocks := make([]map[string]any, 0, len(sys.Parts)+1)
 	if sys.Text != "" {
-		blocks = append(blocks, map[string]any{"type": "text", "text": sys.Text})
+		b := map[string]any{"type": "text", "text": sys.Text}
+		blocks = append(blocks, b)
+		cur.noteBlock(b)
 	}
 	for _, p := range sys.Parts {
+		if _, ok := p.(message.CacheBreakpoint); ok {
+			if err := cur.breakpoint(); err != nil {
+				return nil, err
+			}
+			continue
+		}
 		b, err := encodeContentPart(p)
 		if err != nil {
 			return nil, err
 		}
 		if b != nil {
 			blocks = append(blocks, b)
+			cur.noteBlock(b)
 		}
+	}
+	if len(blocks) == 0 {
+		return nil, nil
 	}
 	return blocks, nil
 }
 
-func encodeMessages(msgs []message.Message) ([]wireMessage, error) {
+func encodeMessages(msgs []message.Message, cur *cacheCursor) ([]wireMessage, error) {
 	var out []wireMessage
 	for _, m := range msgs {
 		switch m.Role {
 		case message.RoleAssistant:
-			blocks, err := encodeAssistantBlocks(m)
+			blocks, err := encodeAssistantBlocks(m, cur)
 			if err != nil {
 				return nil, err
 			}
+			if len(blocks) == 0 {
+				continue
+			}
 			out = append(out, wireMessage{Role: "assistant", Content: blocks})
 		case message.RoleUser:
-			blocks, err := encodeUserBlocks(m)
+			blocks, err := encodeUserBlocks(m, cur)
 			if err != nil {
 				return nil, err
 			}
@@ -320,13 +418,21 @@ func encodeMessages(msgs []message.Message) ([]wireMessage, error) {
 	return out, nil
 }
 
-func encodeAssistantBlocks(m message.Message) ([]map[string]any, error) {
+func encodeAssistantBlocks(m message.Message, cur *cacheCursor) ([]map[string]any, error) {
 	var blocks []map[string]any
+	sawBreakpoint := false
 	for _, p := range m.Parts {
 		switch v := p.(type) {
+		case message.CacheBreakpoint:
+			sawBreakpoint = true
+			if err := cur.breakpoint(); err != nil {
+				return nil, err
+			}
 		case message.Text:
 			if v.Text != "" {
-				blocks = append(blocks, map[string]any{"type": "text", "text": v.Text})
+				b := map[string]any{"type": "text", "text": v.Text}
+				blocks = append(blocks, b)
+				cur.noteBlock(b)
 			}
 		case message.ToolUse:
 			var input any = map[string]any{}
@@ -335,18 +441,21 @@ func encodeAssistantBlocks(m message.Message) ([]map[string]any, error) {
 					input = json.RawMessage(v.Input)
 				}
 			}
-			blocks = append(blocks, map[string]any{
+			b := map[string]any{
 				"type":  "tool_use",
 				"id":    v.ID,
 				"name":  v.Name,
 				"input": input,
-			})
+			}
+			blocks = append(blocks, b)
+			cur.noteBlock(b)
 		case message.Reasoning:
 			block := map[string]any{"type": "thinking", "thinking": v.Text}
 			if v.Signature != "" {
 				block["signature"] = v.Signature
 			}
 			blocks = append(blocks, block)
+			cur.noteBlock(block)
 		case message.Opaque:
 			if v.Vendor != "" && v.Vendor != "anthropic" {
 				return nil, fmt.Errorf("anthropic: opaque vendor %q not supported", v.Vendor)
@@ -356,20 +465,27 @@ func encodeAssistantBlocks(m message.Message) ([]map[string]any, error) {
 				return nil, fmt.Errorf("anthropic: opaque data: %w", err)
 			}
 			blocks = append(blocks, block)
+			cur.noteBlock(block)
 		default:
 			return nil, fmt.Errorf("anthropic: unsupported assistant part %T", p)
 		}
 	}
-	if len(blocks) == 0 {
-		blocks = append(blocks, map[string]any{"type": "text", "text": ""})
+	if len(blocks) == 0 && !sawBreakpoint {
+		b := map[string]any{"type": "text", "text": ""}
+		blocks = append(blocks, b)
+		cur.noteBlock(b)
 	}
 	return blocks, nil
 }
 
-func encodeUserBlocks(m message.Message) ([]map[string]any, error) {
+func encodeUserBlocks(m message.Message, cur *cacheCursor) ([]map[string]any, error) {
 	var blocks []map[string]any
 	for _, p := range m.Parts {
 		switch v := p.(type) {
+		case message.CacheBreakpoint:
+			if err := cur.breakpoint(); err != nil {
+				return nil, err
+			}
 		case message.ToolResult:
 			content := message.TextContent(message.Message{Parts: v.Parts})
 			if content == "" && !v.OK {
@@ -397,12 +513,14 @@ func encodeUserBlocks(m message.Message) ([]map[string]any, error) {
 				}
 				contentVal = nested
 			}
-			blocks = append(blocks, map[string]any{
+			b := map[string]any{
 				"type":        "tool_result",
 				"tool_use_id": v.ToolUseID,
 				"content":     contentVal,
 				"is_error":    !v.OK,
-			})
+			}
+			blocks = append(blocks, b)
+			cur.noteBlock(b)
 		default:
 			b, err := encodeContentPart(p)
 			if err != nil {
@@ -410,6 +528,7 @@ func encodeUserBlocks(m message.Message) ([]map[string]any, error) {
 			}
 			if b != nil {
 				blocks = append(blocks, b)
+				cur.noteBlock(b)
 			}
 		}
 	}
@@ -438,6 +557,8 @@ func encodeContentPart(p message.Part) (map[string]any, error) {
 			return map[string]any{"type": "document", "source": src}, nil
 		}
 		return map[string]any{"type": "image", "source": src}, nil
+	case message.CacheBreakpoint:
+		return nil, fmt.Errorf("anthropic: cache breakpoint must sit beside a content block, not inside tool result content")
 	case message.Audio, message.Video:
 		return nil, fmt.Errorf("anthropic: %T not supported (no native audio/video content blocks)", p)
 	case message.Opaque:

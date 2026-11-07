@@ -71,6 +71,20 @@ func TestValidateOpaqueRequiresCap(t *testing.T) {
 	}
 }
 
+func TestValidateCacheBreakpointDoesNotRequireSystemParts(t *testing.T) {
+	p := stubProvider{caps: model.Capabilities{TextIn: true}}
+	req := model.Request{
+		System: model.System{Text: "rules", Parts: []message.Part{message.CacheBreakpoint{}}},
+		Messages: []message.Message{{
+			Role:  message.RoleUser,
+			Parts: []message.Part{message.Text{Text: "hi"}, message.CacheBreakpoint{}},
+		}},
+	}
+	if err := model.Validate(p, req); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestValidateVideo(t *testing.T) {
 	p := stubProvider{caps: model.Capabilities{TextIn: true, VideoIn: true}}
 	req := model.Request{

@@ -109,3 +109,10 @@ type Opaque struct {
 }
 
 func (Opaque) part() {}
+
+// CacheBreakpoint marks the end of a stable prompt prefix.
+// The Anthropic adapter writes cache_control ephemeral on the preceding block.
+// OpenAI and Gemini skip the marker. It is not model content.
+type CacheBreakpoint struct{}
+
+func (CacheBreakpoint) part() {}

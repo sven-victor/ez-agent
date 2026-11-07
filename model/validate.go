@@ -20,7 +20,7 @@ func Validate(p Provider, req Request) error {
 	if err := validateParts(caps, req.System.Parts, p.Name(), "system"); err != nil {
 		return err
 	}
-	if len(req.System.Parts) > 0 && !caps.SystemParts {
+	if hasContentSystemParts(req.System.Parts) && !caps.SystemParts {
 		return fmt.Errorf("%w: system parts on provider %s", ErrUnsupportedPart, p.Name())
 	}
 	for i, m := range req.Messages {
@@ -94,9 +94,18 @@ func supported(caps Capabilities, part message.Part) bool {
 		return caps.Opaque
 	case message.ToolUse, message.ToolResult:
 		return caps.Tools
-	case message.Reasoning:
+	case message.Reasoning, message.CacheBreakpoint:
 		return true
 	default:
 		return false
 	}
+}
+
+func hasContentSystemParts(parts []message.Part) bool {
+	for _, p := range parts {
+		if _, ok := p.(message.CacheBreakpoint); !ok {
+			return true
+		}
+	}
+	return false
 }

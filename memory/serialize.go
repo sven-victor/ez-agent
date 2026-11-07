@@ -84,6 +84,8 @@ func encodePart(p message.Part, blobDir string) (wirePart, error) {
 		return wirePart{Type: "reasoning", Text: v.Text, Signature: v.Signature}, nil
 	case message.Opaque:
 		return wirePart{Type: "opaque", Name: v.Vendor, Input: v.Data}, nil
+	case message.CacheBreakpoint:
+		return wirePart{Type: "cache_breakpoint"}, nil
 	default:
 		return wirePart{}, fmt.Errorf("encode: unsupported part %T", p)
 	}
@@ -194,6 +196,8 @@ func decodePart(wp wirePart) (message.Part, error) {
 		return tr, nil
 	case "reasoning":
 		return message.Reasoning{Text: wp.Text, Signature: wp.Signature}, nil
+	case "cache_breakpoint":
+		return message.CacheBreakpoint{}, nil
 	default:
 		return nil, fmt.Errorf("decode: unknown part type %q", wp.Type)
 	}

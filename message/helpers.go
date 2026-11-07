@@ -31,6 +31,27 @@ func HasToolUse(m Message) bool {
 	return len(ToolUses(m)) > 0
 }
 
+// WithoutCacheBreakpoints copies parts with CacheBreakpoint markers removed.
+// Nested ToolResult parts are copied the same way.
+func WithoutCacheBreakpoints(parts []Part) []Part {
+	if len(parts) == 0 {
+		return nil
+	}
+	out := make([]Part, 0, len(parts))
+	for _, p := range parts {
+		if _, ok := p.(CacheBreakpoint); ok {
+			continue
+		}
+		if tr, ok := p.(ToolResult); ok {
+			tr.Parts = WithoutCacheBreakpoints(tr.Parts)
+			out = append(out, tr)
+			continue
+		}
+		out = append(out, p)
+	}
+	return out
+}
+
 // TextContent concatenates all Text parts.
 func TextContent(m Message) string {
 	var s string
