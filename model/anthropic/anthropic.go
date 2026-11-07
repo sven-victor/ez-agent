@@ -522,15 +522,47 @@ type streamEvent struct {
 		Input     json.RawMessage `json:"input"`
 	} `json:"content_block"`
 	Message *struct {
-		Usage *struct {
-			InputTokens  int `json:"input_tokens"`
-			OutputTokens int `json:"output_tokens"`
-		} `json:"usage"`
+		Usage *anthropicUsage `json:"usage"`
 	} `json:"message"`
-	Usage *struct {
-		InputTokens  int `json:"input_tokens"`
-		OutputTokens int `json:"output_tokens"`
-	} `json:"usage"`
+	Usage *anthropicUsage `json:"usage"`
+}
+
+// anthropicUsage is one Messages API usage object.
+// input_tokens excludes cache read and cache write; those are added into InputTokens.
+type anthropicUsage struct {
+	InputTokens              *int `json:"input_tokens"`
+	OutputTokens             *int `json:"output_tokens"`
+	CacheCreationInputTokens *int `json:"cache_creation_input_tokens"`
+	CacheReadInputTokens     *int `json:"cache_read_input_tokens"`
+}
+
+// applyAnthropicUsage merges one usage event into dst.
+// Missing fields keep the previous value so a message_delta that only
+// reports output_tokens does not clear cache counts from message_start.
+func applyAnthropicUsage(dst *run.Usage, u *anthropicUsage) {
+	if u == nil {
+		return
+	}
+	base := dst.InputTokens - dst.CacheReadTokens - dst.CacheWriteTokens
+	if base < 0 {
+		base = 0
+	}
+	if u.InputTokens != nil {
+		base = *u.InputTokens
+	}
+	if u.CacheReadInputTokens != nil {
+		dst.CacheReadTokens = *u.CacheReadInputTokens
+	}
+	if u.CacheCreationInputTokens != nil {
+		dst.CacheWriteTokens = *u.CacheCreationInputTokens
+	}
+	if u.InputTokens != nil || u.CacheReadInputTokens != nil || u.CacheCreationInputTokens != nil {
+		dst.InputTokens = base + dst.CacheReadTokens + dst.CacheWriteTokens
+	}
+	if u.OutputTokens != nil {
+		dst.OutputTokens = *u.OutputTokens
+	}
+	dst.TotalTokens = dst.InputTokens + dst.OutputTokens
 }
 
 type blockAcc struct {
@@ -580,10 +612,8 @@ func decodeStream(r io.Reader, yield func(event.Event) error) (model.Result, err
 		}
 		switch ev.Type {
 		case "message_start":
-			if ev.Message != nil && ev.Message.Usage != nil {
-				usage.InputTokens = ev.Message.Usage.InputTokens
-				usage.OutputTokens = ev.Message.Usage.OutputTokens
-				usage.TotalTokens = usage.InputTokens + usage.OutputTokens
+			if ev.Message != nil {
+				applyAnthropicUsage(&usage, ev.Message.Usage)
 			}
 		case "content_block_start":
 			acc := &blockAcc{}
@@ -632,15 +662,7 @@ func decodeStream(r io.Reader, yield func(event.Event) error) (model.Result, err
 			if ev.Delta != nil && ev.Delta.StopReason != "" {
 				stopReason = ev.Delta.StopReason
 			}
-			if ev.Usage != nil {
-				if ev.Usage.OutputTokens > 0 {
-					usage.OutputTokens = ev.Usage.OutputTokens
-				}
-				if ev.Usage.InputTokens > 0 {
-					usage.InputTokens = ev.Usage.InputTokens
-				}
-				usage.TotalTokens = usage.InputTokens + usage.OutputTokens
-			}
+			applyAnthropicUsage(&usage, ev.Usage)
 		}
 	}
 	if err := scanner.Err(); err != nil {
@@ -708,11 +730,8 @@ type completeResponse struct {
 		Signature string          `json:"signature"`
 		Input     json.RawMessage `json:"input"`
 	} `json:"content"`
-	StopReason string `json:"stop_reason"`
-	Usage      *struct {
-		InputTokens  int `json:"input_tokens"`
-		OutputTokens int `json:"output_tokens"`
-	} `json:"usage"`
+	StopReason string          `json:"stop_reason"`
+	Usage      *anthropicUsage `json:"usage"`
 }
 
 func decodeComplete(r io.Reader) (model.Result, error) {
@@ -754,13 +773,7 @@ func decodeComplete(r io.Reader) (model.Result, error) {
 		}
 	}
 	var usage run.Usage
-	if resp.Usage != nil {
-		usage = run.Usage{
-			InputTokens:  resp.Usage.InputTokens,
-			OutputTokens: resp.Usage.OutputTokens,
-			TotalTokens:  resp.Usage.InputTokens + resp.Usage.OutputTokens,
-		}
-	}
+	applyAnthropicUsage(&usage, resp.Usage)
 	return model.Result{
 		Message:     msg,
 		StopReason:  mapStopReason(resp.StopReason, hasTools),

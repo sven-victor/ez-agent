@@ -197,3 +197,44 @@ func TestOpenAIOrganizationAndHeaders(t *testing.T) {
 		t.Fatalf("Authorization=%q", gotAuth)
 	}
 }
+
+func TestOpenAIUsageCache(t *testing.T) {
+	const body = `{"choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":100,"completion_tokens":20,"total_tokens":999,"prompt_tokens_details":{"cached_tokens":80}}}`
+	want := run.NewUsage(100, 20, 80, 0)
+
+	t.Run("complete", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(body))
+		}))
+		defer srv.Close()
+		p := openai.New(openai.WithBaseURL(srv.URL), openai.WithAPIKey("test"), openai.WithHTTPClient(srv.Client()))
+		res, err := p.Complete(context.Background(), model.Request{
+			Messages: []message.Message{message.NewUserText("hi")},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res.Usage != want {
+			t.Fatalf("usage=%+v want %+v", res.Usage, want)
+		}
+	})
+
+	t.Run("stream", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = w.Write([]byte("data: " + body + "\n\ndata: [DONE]\n\n"))
+		}))
+		defer srv.Close()
+		p := openai.New(openai.WithBaseURL(srv.URL), openai.WithAPIKey("test"), openai.WithHTTPClient(srv.Client()))
+		res, err := p.Stream(context.Background(), model.Request{
+			Messages: []message.Message{message.NewUserText("hi")},
+		}, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res.Usage != want {
+			t.Fatalf("usage=%+v want %+v", res.Usage, want)
+		}
+	})
+}

@@ -16,11 +16,28 @@ const (
 	StopInterrupted StopReason = "interrupted" // HITL pause at tool boundary
 )
 
-// Usage tracks token consumption.
+// Usage is the token consumption of one model call.
+// InputTokens and OutputTokens are inclusive totals.
+// Cache fields are subsets of InputTokens and must not be added to it again.
 type Usage struct {
-	InputTokens  int
-	OutputTokens int
-	TotalTokens  int
+	InputTokens      int // full prompt, including cache read and cache write
+	OutputTokens     int // full completion, including reasoning or thinking tokens
+	TotalTokens      int // InputTokens + OutputTokens
+	CacheReadTokens  int // subset of InputTokens served from prompt cache
+	CacheWriteTokens int // subset of InputTokens written to prompt cache
+}
+
+// NewUsage normalizes provider counts into one Usage.
+// input is the full prompt; cacheRead and cacheWrite are already included in it.
+// TotalTokens is always input + output. Provider-reported totals are not stored.
+func NewUsage(input, output, cacheRead, cacheWrite int) Usage {
+	return Usage{
+		InputTokens:      input,
+		OutputTokens:     output,
+		TotalTokens:      input + output,
+		CacheReadTokens:  cacheRead,
+		CacheWriteTokens: cacheWrite,
+	}
 }
 
 // Add merges other into u.
@@ -28,6 +45,8 @@ func (u *Usage) Add(other Usage) {
 	u.InputTokens += other.InputTokens
 	u.OutputTokens += other.OutputTokens
 	u.TotalTokens += other.TotalTokens
+	u.CacheReadTokens += other.CacheReadTokens
+	u.CacheWriteTokens += other.CacheWriteTokens
 }
 
 // Limits constrain a run.

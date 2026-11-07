@@ -433,11 +433,29 @@ type genResponse struct {
 		} `json:"content"`
 		FinishReason string `json:"finishReason"`
 	} `json:"candidates"`
-	UsageMetadata *struct {
-		PromptTokenCount     int `json:"promptTokenCount"`
-		CandidatesTokenCount int `json:"candidatesTokenCount"`
-		TotalTokenCount      int `json:"totalTokenCount"`
-	} `json:"usageMetadata"`
+	UsageMetadata *geminiUsageMetadata `json:"usageMetadata"`
+}
+
+// geminiUsageMetadata is one generateContent usageMetadata object.
+// promptTokenCount already includes cached content. thoughtsTokenCount is
+// part of the completion. totalTokenCount is ignored.
+type geminiUsageMetadata struct {
+	PromptTokenCount        int `json:"promptTokenCount"`
+	CandidatesTokenCount    int `json:"candidatesTokenCount"`
+	ThoughtsTokenCount      int `json:"thoughtsTokenCount"`
+	CachedContentTokenCount int `json:"cachedContentTokenCount"`
+}
+
+func (m *geminiUsageMetadata) normalized() run.Usage {
+	if m == nil {
+		return run.Usage{}
+	}
+	return run.NewUsage(
+		m.PromptTokenCount,
+		m.CandidatesTokenCount+m.ThoughtsTokenCount,
+		m.CachedContentTokenCount,
+		0,
+	)
 }
 
 type genAcc struct {
@@ -451,11 +469,7 @@ type genAcc struct {
 
 func (a *genAcc) apply(chunk genResponse, yield func(event.Event) error) error {
 	if chunk.UsageMetadata != nil {
-		a.usage = run.Usage{
-			InputTokens:  chunk.UsageMetadata.PromptTokenCount,
-			OutputTokens: chunk.UsageMetadata.CandidatesTokenCount,
-			TotalTokens:  chunk.UsageMetadata.TotalTokenCount,
-		}
+		a.usage = chunk.UsageMetadata.normalized()
 	}
 	if len(chunk.Candidates) == 0 {
 		return nil

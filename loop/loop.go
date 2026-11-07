@@ -113,6 +113,8 @@ func (l *Loop) Run(ctx context.Context, st *run.State, emit EmitFunc) (res *run.
 				"input_tokens", res.Usage.InputTokens,
 				"output_tokens", res.Usage.OutputTokens,
 				"total_tokens", res.Usage.TotalTokens,
+				"cache_read_tokens", res.Usage.CacheReadTokens,
+				"cache_write_tokens", res.Usage.CacheWriteTokens,
 			)
 			l.saveCheckpoint(context.WithoutCancel(ctx), st)
 		} else if err != nil {
@@ -295,6 +297,8 @@ func (l *Loop) Run(ctx context.Context, st *run.State, emit EmitFunc) (res *run.
 			"stop_reason", mres.StopReason,
 			"input_tokens", mres.Usage.InputTokens,
 			"output_tokens", mres.Usage.OutputTokens,
+			"cache_read_tokens", mres.Usage.CacheReadTokens,
+			"cache_write_tokens", mres.Usage.CacheWriteTokens,
 		)
 
 		msg := sanitizeIncompleteToolUse(mres, log)

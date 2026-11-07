@@ -167,3 +167,62 @@ func TestAnthropicWithHeader(t *testing.T) {
 		t.Fatalf("x-api-key=%q", gotKey)
 	}
 }
+
+func TestAnthropicUsageCache(t *testing.T) {
+	// input_tokens excludes cache. Inclusive prompt is 10+20+30.
+	// Provider does not send a total; message_delta only updates output.
+	want := run.NewUsage(60, 15, 30, 20)
+
+	t.Run("complete", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{
+				"content":[{"type":"text","text":"ok"}],
+				"stop_reason":"end_turn",
+				"usage":{
+					"input_tokens":10,
+					"output_tokens":15,
+					"cache_creation_input_tokens":20,
+					"cache_read_input_tokens":30
+				}
+			}`))
+		}))
+		defer srv.Close()
+		p := anthropic.New(anthropic.WithBaseURL(srv.URL), anthropic.WithAPIKey("test"), anthropic.WithHTTPClient(srv.Client()))
+		res, err := p.Complete(context.Background(), model.Request{
+			Messages: []message.Message{message.NewUserText("hi")},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res.Usage != want {
+			t.Fatalf("usage=%+v want %+v", res.Usage, want)
+		}
+	})
+
+	t.Run("stream", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = w.Write([]byte("" +
+				"event: message_start\n" +
+				"data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10,\"output_tokens\":1,\"cache_creation_input_tokens\":20,\"cache_read_input_tokens\":30}}}\n\n" +
+				"event: content_block_delta\n" +
+				"data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\n" +
+				"event: message_delta\n" +
+				"data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":15}}\n\n" +
+				"event: message_stop\n" +
+				"data: {\"type\":\"message_stop\"}\n\n"))
+		}))
+		defer srv.Close()
+		p := anthropic.New(anthropic.WithBaseURL(srv.URL), anthropic.WithAPIKey("test"), anthropic.WithHTTPClient(srv.Client()))
+		res, err := p.Stream(context.Background(), model.Request{
+			Messages: []message.Message{message.NewUserText("hi")},
+		}, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res.Usage != want {
+			t.Fatalf("usage=%+v want %+v", res.Usage, want)
+		}
+	})
+}

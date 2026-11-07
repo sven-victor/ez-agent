@@ -601,11 +601,29 @@ type streamChunk struct {
 		} `json:"delta"`
 		FinishReason *string `json:"finish_reason"`
 	} `json:"choices"`
-	Usage *struct {
-		PromptTokens     int `json:"prompt_tokens"`
-		CompletionTokens int `json:"completion_tokens"`
-		TotalTokens      int `json:"total_tokens"`
-	} `json:"usage"`
+	Usage *openAIUsage `json:"usage"`
+}
+
+// openAIUsage is one Chat Completions usage object.
+// prompt_tokens already includes cached tokens. The provider total_tokens
+// field is ignored; run.Usage.TotalTokens is prompt plus completion.
+type openAIUsage struct {
+	PromptTokens        int `json:"prompt_tokens"`
+	CompletionTokens    int `json:"completion_tokens"`
+	PromptTokensDetails *struct {
+		CachedTokens int `json:"cached_tokens"`
+	} `json:"prompt_tokens_details"`
+}
+
+func (u *openAIUsage) normalized() run.Usage {
+	if u == nil {
+		return run.Usage{}
+	}
+	cacheRead := 0
+	if u.PromptTokensDetails != nil {
+		cacheRead = u.PromptTokensDetails.CachedTokens
+	}
+	return run.NewUsage(u.PromptTokens, u.CompletionTokens, cacheRead, 0)
 }
 
 type toolCallAcc struct {
@@ -644,11 +662,7 @@ func decodeStream(r io.Reader, yield func(event.Event) error) (model.Result, err
 			continue
 		}
 		if chunk.Usage != nil {
-			usage = run.Usage{
-				InputTokens:  chunk.Usage.PromptTokens,
-				OutputTokens: chunk.Usage.CompletionTokens,
-				TotalTokens:  chunk.Usage.TotalTokens,
-			}
+			usage = chunk.Usage.normalized()
 		}
 		if len(chunk.Choices) == 0 {
 			continue
@@ -765,11 +779,7 @@ type completeResponse struct {
 		} `json:"message"`
 		FinishReason string `json:"finish_reason"`
 	} `json:"choices"`
-	Usage *struct {
-		PromptTokens     int `json:"prompt_tokens"`
-		CompletionTokens int `json:"completion_tokens"`
-		TotalTokens      int `json:"total_tokens"`
-	} `json:"usage"`
+	Usage *openAIUsage `json:"usage"`
 }
 
 func decodeComplete(r io.Reader) (model.Result, error) {
@@ -805,14 +815,7 @@ func decodeComplete(r io.Reader) (model.Result, error) {
 			Input: []byte(tc.Function.Arguments),
 		})
 	}
-	var usage run.Usage
-	if resp.Usage != nil {
-		usage = run.Usage{
-			InputTokens:  resp.Usage.PromptTokens,
-			OutputTokens: resp.Usage.CompletionTokens,
-			TotalTokens:  resp.Usage.TotalTokens,
-		}
-	}
+	usage := resp.Usage.normalized()
 	return model.Result{
 		Message:     msg,
 		StopReason:  mapFinishReason(ch.FinishReason, len(ch.Message.ToolCalls) > 0),

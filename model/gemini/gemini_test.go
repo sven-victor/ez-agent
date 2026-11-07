@@ -100,3 +100,46 @@ func TestGeminiWithHeader(t *testing.T) {
 		t.Fatalf("X-Custom=%q", gotCustom)
 	}
 }
+
+func TestGeminiUsageCache(t *testing.T) {
+	// promptTokenCount already includes cached content. thoughts are output.
+	// totalTokenCount is a different vendor total and must not be stored.
+	const body = `{"candidates":[{"content":{"parts":[{"text":"ok"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":100,"candidatesTokenCount":10,"thoughtsTokenCount":5,"cachedContentTokenCount":40,"totalTokenCount":999}}`
+	want := run.NewUsage(100, 15, 40, 0)
+
+	t.Run("complete", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(body))
+		}))
+		defer srv.Close()
+		p := gemini.New(gemini.WithBaseURL(srv.URL), gemini.WithAPIKey("k"), gemini.WithHTTPClient(srv.Client()))
+		res, err := p.Complete(context.Background(), model.Request{
+			Messages: []message.Message{message.NewUserText("hey")},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res.Usage != want {
+			t.Fatalf("usage=%+v want %+v", res.Usage, want)
+		}
+	})
+
+	t.Run("stream", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = w.Write([]byte("data: " + body + "\n\n"))
+		}))
+		defer srv.Close()
+		p := gemini.New(gemini.WithBaseURL(srv.URL), gemini.WithAPIKey("k"), gemini.WithHTTPClient(srv.Client()))
+		res, err := p.Stream(context.Background(), model.Request{
+			Messages: []message.Message{message.NewUserText("hey")},
+		}, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res.Usage != want {
+			t.Fatalf("usage=%+v want %+v", res.Usage, want)
+		}
+	})
+}

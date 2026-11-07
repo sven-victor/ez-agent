@@ -754,7 +754,9 @@ func (m *tuiModel) statusLine() string {
 	parts := []string{
 		fmt.Sprintf("ctx %d msgs ~%d tok", m.ctxMsgs, m.ctxTokens),
 		"turn " + turns,
-		fmt.Sprintf("tok in=%d out=%d total=%d", m.usage.InputTokens, m.usage.OutputTokens, m.usage.TotalTokens),
+		fmt.Sprintf("tok in=%d out=%d total=%d cache r=%d w=%d",
+			m.usage.InputTokens, m.usage.OutputTokens, m.usage.TotalTokens,
+			m.usage.CacheReadTokens, m.usage.CacheWriteTokens),
 		"mcp " + m.meta.MCP,
 		m.meta.Provider + "/" + m.meta.Model,
 	}
